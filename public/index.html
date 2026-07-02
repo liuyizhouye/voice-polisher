@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>口述整理台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <i data-lucide="audio-waveform"></i>
+          </div>
+          <div>
+            <h1>口述整理台</h1>
+            <p id="supportStatus">正在检测听写能力</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button class="icon-button" id="themeButton" type="button" title="切换主题">
+            <i data-lucide="sun-moon"></i>
+          </button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="tool-panel dictation-panel" aria-labelledby="dictationTitle">
+          <div class="panel-head">
+            <div>
+              <h2 id="dictationTitle">原始口述</h2>
+              <p id="listenState">准备记录</p>
+            </div>
+            <span class="time-pill" id="recordTimer">00:00</span>
+          </div>
+
+          <canvas class="wave-canvas" id="waveCanvas" width="1100" height="230"></canvas>
+
+          <div class="control-row">
+            <button class="primary-action" id="recordButton" type="button">
+              <i data-lucide="mic"></i>
+              <span>开始</span>
+            </button>
+            <button class="ghost-action" id="clearTranscriptButton" type="button">
+              <i data-lucide="trash-2"></i>
+              <span>清空</span>
+            </button>
+          </div>
+
+          <label class="field-label" for="transcriptInput">听写文本</label>
+          <textarea
+            id="transcriptInput"
+            class="text-box transcript-box"
+            spellcheck="false"
+            placeholder="这里会出现听写文字，也可以直接输入。"
+          ></textarea>
+
+          <div class="interim-line" id="interimText" aria-live="polite"></div>
+        </section>
+
+        <section class="tool-panel result-panel" aria-labelledby="resultTitle">
+          <div class="panel-head">
+            <div>
+              <h2 id="resultTitle">整理结果</h2>
+              <p id="modelStatus">DeepSeek 未连接</p>
+            </div>
+            <span class="model-pill" id="modelChip">deepseek-v4-flash</span>
+          </div>
+
+          <div class="settings-grid">
+            <label>
+              <span>场景</span>
+              <select id="modeSelect">
+                <option value="daily">个人记录</option>
+                <option value="work">工作记录</option>
+                <option value="todo">待办清单</option>
+                <option value="formal">正式表达</option>
+              </select>
+            </label>
+            <label>
+              <span>详略</span>
+              <select id="densitySelect">
+                <option value="balanced">自然整理</option>
+                <option value="concise">只留核心</option>
+                <option value="complete">完整表达</option>
+              </select>
+            </label>
+            <label>
+              <span>语言</span>
+              <select id="languageSelect">
+                <option value="zh-CN">普通话</option>
+                <option value="zh-TW">繁体中文</option>
+                <option value="en-US">English</option>
+              </select>
+            </label>
+            <label>
+              <span>模型</span>
+              <input id="modelInput" type="text" autocomplete="off" value="deepseek-v4-flash" />
+            </label>
+          </div>
+
+          <div class="key-row">
+            <label class="key-field">
+              <span>API key</span>
+              <input
+                id="apiKeyInput"
+                type="password"
+                autocomplete="off"
+                placeholder="sk-..."
+              />
+            </label>
+            <label class="remember-key">
+              <input id="rememberKeyInput" type="checkbox" />
+              <span>记住</span>
+            </label>
+            <button class="ghost-action key-connect" id="connectButton" type="button">
+              <i data-lucide="plug-zap"></i>
+              <span>连接</span>
+            </button>
+          </div>
+
+          <button class="refine-button" id="refineButton" type="button">
+            <i data-lucide="sparkles"></i>
+            <span>整理</span>
+          </button>
+
+          <label class="field-label" for="resultOutput">正文</label>
+          <textarea
+            id="resultOutput"
+            class="text-box result-box"
+            spellcheck="false"
+            placeholder="整理后的内容会出现在这里。"
+          ></textarea>
+
+          <div class="result-actions">
+            <button class="ghost-action" id="copyButton" type="button">
+              <i data-lucide="copy"></i>
+              <span>复制</span>
+            </button>
+            <button class="ghost-action" id="downloadButton" type="button">
+              <i data-lucide="download"></i>
+              <span>下载</span>
+            </button>
+          </div>
+        </section>
+
+        <section class="history-band" aria-labelledby="historyTitle">
+          <div class="history-head">
+            <div>
+              <h2 id="historyTitle">最近整理</h2>
+              <p id="historyCount">0 条</p>
+            </div>
+            <button class="icon-button" id="clearHistoryButton" type="button" title="清空历史">
+              <i data-lucide="archive-x"></i>
+            </button>
+          </div>
+          <div class="history-list" id="historyList"></div>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
