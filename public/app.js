@@ -11,6 +11,10 @@ const elements = {
   clearTranscriptButton: $("#clearTranscriptButton"),
   microphoneSelect: $("#microphoneSelect"),
   refreshDevicesButton: $("#refreshDevicesButton"),
+  engineStatus: $("#engineStatus"),
+  engineStatusText: $("#engineStatusText"),
+  engineStatusPercent: $("#engineStatusPercent"),
+  engineProgressBar: $("#engineProgressBar"),
   transcriptInput: $("#transcriptInput"),
   interimText: $("#interimText"),
   modeSelect: $("#modeSelect"),
@@ -44,10 +48,14 @@ const storageKeys = {
 
 let recognition = null;
 let recognitionState = "idle";
+let localWhisper = { available: false };
+let localWhisperEventSource = null;
+let localWhisperReady = false;
 let nativeSpeech = { available: false };
 let nativeEventSource = null;
 let activeRecorder = "browser";
 let isRecording = false;
+let isTranscribing = false;
 let shouldRestart = false;
 let timerId = null;
 let recordingWatchdogId = null;
@@ -74,6 +82,7 @@ async function init() {
   try {
     const response = await fetch("/api/health");
     const health = await response.json();
+    localWhisper = health.localWhisper || { available: false };
     nativeSpeech = health.nativeSpeech || { available: false };
     elements.modelInput.value = health.defaultModel || "deepseek-v4-flash";
     elements.modelChip.textContent = elements.modelInput.value;
@@ -82,7 +91,23 @@ async function init() {
     elements.modelStatus.textContent = "本地服务未响应";
   }
 
-  if (nativeSpeech.available) {
+  if (localWhisper.available) {
+    activeRecorder = "whisper";
+    localWhisperReady = Boolean(localWhisper.ready);
+    elements.supportStatus.textContent =
+      `本地 Whisper ${localWhisper.device || "cuda"} / ${localWhisper.defaultModel || "large-v3"}`;
+    elements.listenState.textContent = localWhisperReady
+      ? "本地 Whisper 已就绪"
+      : "正在准备本地 Whisper";
+    renderLocalWhisperMicrophoneOptions();
+    updateLocalWhisperProgress(localWhisper);
+    await openLocalWhisperEvents();
+    loadLocalWhisperDevices().catch(() => {
+      elements.listenState.textContent = "麦克风列表读取失败，将使用系统默认输入";
+    });
+    preloadLocalWhisperModel();
+    updateRecordingUi();
+  } else if (nativeSpeech.available) {
     activeRecorder = "native";
     elements.supportStatus.textContent = "Windows 系统听写可用";
     elements.listenState.textContent = "准备使用系统麦克风";
@@ -102,6 +127,8 @@ async function init() {
 
 function bindEvents() {
   elements.recordButton.addEventListener("click", () => {
+    if (isTranscribing) return;
+
     if (isRecording) {
       stopRecording();
     } else {
@@ -116,6 +143,14 @@ function bindEvents() {
   });
 
   elements.microphoneSelect.addEventListener("change", () => {
+    if (localWhisper.available) {
+      localStorage.setItem(storageKeys.microphone, elements.microphoneSelect.value);
+      elements.listenState.textContent = elements.microphoneSelect.value
+        ? "本地 Whisper 麦克风已选择"
+        : "本地 Whisper 使用系统默认麦克风";
+      return;
+    }
+
     if (nativeSpeech.available) {
       elements.listenState.textContent = "系统听写使用 Windows 默认麦克风";
       return;
@@ -131,6 +166,19 @@ function bindEvents() {
   });
 
   elements.refreshDevicesButton.addEventListener("click", async () => {
+    if (localWhisper.available) {
+      elements.refreshDevicesButton.disabled = true;
+      try {
+        await loadLocalWhisperDevices();
+        showToast("麦克风列表已刷新");
+      } catch (error) {
+        showToast(error?.message || "麦克风列表读取失败");
+      } finally {
+        elements.refreshDevicesButton.disabled = false;
+      }
+      return;
+    }
+
     if (nativeSpeech.available) {
       showToast("系统听写使用 Windows 默认麦克风");
       elements.listenState.textContent = "请在 Windows 声音设置里切换默认输入设备";
@@ -194,6 +242,10 @@ function bindEvents() {
 }
 
 async function startRecording() {
+  if (localWhisper.available) {
+    return await startLocalWhisperRecording();
+  }
+
   if (nativeSpeech.available) {
     return await startNativeRecording();
   }
@@ -234,6 +286,11 @@ async function startRecording() {
 }
 
 function stopRecording() {
+  if (activeRecorder === "whisper") {
+    stopLocalWhisperRecording();
+    return;
+  }
+
   if (activeRecorder === "native") {
     stopNativeRecording();
     return;
@@ -257,6 +314,230 @@ function stopRecording() {
   stopRecordingWatchdog();
   stopAudioMeter();
   elements.listenState.textContent = "已暂停";
+}
+
+async function startLocalWhisperRecording() {
+  if (!localWhisperReady) {
+    elements.listenState.textContent = "本地 Whisper 模型还在下载/加载";
+    showToast("请等本地 Whisper 进度条完成");
+    return;
+  }
+
+  try {
+    activeRecorder = "whisper";
+    isRecording = true;
+    isTranscribing = false;
+    recognitionState = "starting";
+    startedAt = Date.now();
+    updateRecordingUi();
+    startTimer();
+    drawSyntheticWave();
+    await openLocalWhisperEvents();
+    elements.listenState.textContent = "正在启动本地 Whisper 录音";
+
+    const response = await fetch("/api/local-whisper/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        language: elements.languageSelect.value,
+        inputDevice: elements.microphoneSelect.value || null
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(payload.error || "本地 Whisper 启动失败");
+    }
+  } catch (error) {
+    isRecording = false;
+    isTranscribing = false;
+    recognitionState = "idle";
+    updateRecordingUi();
+    stopTimer();
+    stopAudioMeter();
+    elements.listenState.textContent = "本地 Whisper 启动失败";
+    showToast(error?.message || "本地 Whisper 启动失败");
+  }
+}
+
+async function stopLocalWhisperRecording() {
+  if (!isRecording) return;
+
+  isRecording = false;
+  isTranscribing = true;
+  recognitionState = "transcribing";
+  elements.interimText.textContent = "";
+  updateRecordingUi();
+  stopTimer();
+  elements.listenState.textContent = "正在本地转写";
+
+  await fetch("/api/local-whisper/stop", { method: "POST" }).catch(() => {});
+}
+
+function openLocalWhisperEvents() {
+  if (localWhisperEventSource) {
+    return Promise.resolve();
+  }
+
+  return new Promise(resolve => {
+    let resolved = false;
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      resolve();
+    };
+
+    localWhisperEventSource = new EventSource("/api/local-whisper/events");
+    localWhisperEventSource.onopen = finish;
+
+    localWhisperEventSource.onmessage = event => {
+      try {
+        handleLocalWhisperEvent(JSON.parse(event.data));
+      } catch {
+        // Ignore malformed diagnostic messages.
+      }
+    };
+
+    localWhisperEventSource.onerror = () => {
+      finish();
+      if (!isRecording && !isTranscribing) return;
+      elements.listenState.textContent = "本地 Whisper 连接中断";
+    };
+
+    window.setTimeout(finish, 500);
+  });
+}
+
+function closeLocalWhisperEvents() {
+  if (localWhisperEventSource) {
+    localWhisperEventSource.close();
+    localWhisperEventSource = null;
+  }
+}
+
+function handleLocalWhisperEvent(event) {
+  if (!event?.type) return;
+
+  if (event.type === "status") {
+    if (event.localWhisper) {
+      updateLocalWhisperProgress(event.localWhisper);
+    }
+    return;
+  }
+
+  if (event.type === "progress") {
+    updateLocalWhisperProgress(event);
+    return;
+  }
+
+  if (event.type === "devices") {
+    renderLocalWhisperMicrophoneOptions(event.devices || []);
+    return;
+  }
+
+  if (event.type === "ready") {
+    localWhisperReady = true;
+    updateLocalWhisperProgress({ ...event, ready: true, progress: 100 });
+    recognitionState = "started";
+    elements.supportStatus.textContent =
+      `本地 Whisper ${event.device || "cuda"} / ${event.model || "large-v3"}`;
+    elements.listenState.textContent = `本地 Whisper 已准备 (${event.model || "large-v3"})`;
+    updateRecordingUi();
+    return;
+  }
+
+  if (event.type === "recording") {
+    recognitionState = "recording";
+    elements.listenState.textContent = "正在录音";
+    return;
+  }
+
+  if (event.type === "level") {
+    return;
+  }
+
+  if (event.type === "transcribing") {
+    isRecording = false;
+    isTranscribing = true;
+    recognitionState = "transcribing";
+    updateRecordingUi();
+    stopTimer();
+    elements.listenState.textContent = "正在本地转写";
+    return;
+  }
+
+  if (event.type === "result") {
+    const text = String(event.text || "").trim();
+    if (text) {
+      elements.transcriptInput.value = joinSpeech(elements.transcriptInput.value, text);
+      elements.listenState.textContent = "本地转写完成";
+      showToast("本地转写完成");
+    } else {
+      elements.listenState.textContent = "没有转写出文字";
+      showToast("没有转写出文字");
+    }
+    elements.interimText.textContent = "";
+    return;
+  }
+
+  if (event.type === "idle") {
+    isRecording = false;
+    isTranscribing = false;
+    recognitionState = "idle";
+    updateRecordingUi();
+    stopTimer();
+    stopAudioMeter();
+    if (
+      localWhisperReady &&
+      ["正在", "启动", "录音"].some(word => elements.listenState.textContent.includes(word))
+    ) {
+      elements.listenState.textContent = "本地 Whisper 已就绪";
+    }
+    return;
+  }
+
+  if (event.type === "warning") {
+    elements.interimText.textContent = event.message || "";
+    return;
+  }
+
+  if (event.type === "error") {
+    const message = translateLocalWhisperMessage(event.message);
+    if (event.fatal) {
+      localWhisperReady = false;
+      updateLocalWhisperProgress({
+        progress: 0,
+        ready: false,
+        loading: false,
+        message
+      });
+    }
+    isRecording = false;
+    isTranscribing = false;
+    recognitionState = "idle";
+    updateRecordingUi();
+    stopTimer();
+    stopAudioMeter();
+    elements.listenState.textContent = message;
+    showToast(message);
+    return;
+  }
+
+  if (event.type === "workerStopped") {
+    localWhisperReady = false;
+    isRecording = false;
+    isTranscribing = false;
+    recognitionState = "idle";
+    updateRecordingUi();
+    stopTimer();
+    stopAudioMeter();
+    updateLocalWhisperProgress({
+      progress: 0,
+      ready: false,
+      loading: false,
+      message: "本地 Whisper 已停止"
+    });
+  }
 }
 
 async function startNativeRecording() {
@@ -649,9 +930,20 @@ function getCanvasColor(name) {
 }
 
 function updateRecordingUi() {
+  const waitingForLocalWhisper =
+    activeRecorder === "whisper" && localWhisper.available && !localWhisperReady;
   elements.recordButton.classList.toggle("is-recording", isRecording);
-  elements.recordButtonLabel.textContent = isRecording ? "暂停" : "开始";
-  elements.recordButtonIcon.innerHTML = `<i data-lucide="${isRecording ? "pause" : "mic"}"></i>`;
+  elements.recordButton.disabled = isTranscribing || waitingForLocalWhisper;
+  elements.recordButtonLabel.textContent = isTranscribing
+    ? "转写中"
+    : isRecording
+      ? "暂停"
+      : waitingForLocalWhisper
+        ? "准备中"
+        : "开始";
+  elements.recordButtonIcon.innerHTML = `<i data-lucide="${
+    isTranscribing || waitingForLocalWhisper ? "loader-circle" : isRecording ? "pause" : "mic"
+  }"></i>`;
   if (window.lucide) window.lucide.createIcons();
 }
 
@@ -698,6 +990,73 @@ function stopTimer() {
   if (!isRecording) {
     elements.recordTimer.textContent = "00:00";
   }
+}
+
+async function preloadLocalWhisperModel() {
+  if (!localWhisper.available) return;
+
+  try {
+    const response = await fetch("/api/local-whisper/preload", { method: "POST" });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(payload.error || "本地 Whisper 预加载失败");
+    }
+
+    if (payload.localWhisper) {
+      updateLocalWhisperProgress(payload.localWhisper);
+    }
+  } catch (error) {
+    localWhisperReady = false;
+    updateRecordingUi();
+    elements.listenState.textContent = error?.message || "本地 Whisper 预加载失败";
+    showToast(error?.message || "本地 Whisper 预加载失败");
+  }
+}
+
+async function loadLocalWhisperDevices() {
+  const response = await fetch("/api/local-whisper/devices");
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(payload.error || "麦克风列表读取失败");
+  }
+
+  renderLocalWhisperMicrophoneOptions(payload.devices || []);
+}
+
+function updateLocalWhisperProgress(status) {
+  if (!elements.engineStatus) return;
+
+  elements.engineStatus.classList.remove("is-hidden");
+
+  const progress = clampPercent(
+    status.progress ?? (status.ready ? 100 : localWhisperReady ? 100 : 0)
+  );
+  localWhisperReady = Boolean(status.ready || progress >= 100);
+
+  const model = status.model || status.defaultModel || localWhisper.defaultModel || "large-v3";
+  const device = status.device || localWhisper.device || "cuda";
+  const computeType = status.computeType || localWhisper.computeType || "float16";
+  const message =
+    status.message ||
+    (localWhisperReady
+      ? `已加载 ${model} (${device}/${computeType})`
+      : `正在准备 ${model} (${device}/${computeType})`);
+
+  elements.engineStatusText.textContent = message;
+  elements.engineStatusPercent.textContent = `${progress}%`;
+  elements.engineProgressBar.style.width = `${progress}%`;
+  elements.engineStatus.classList.toggle("is-ready", localWhisperReady);
+  elements.engineStatus.classList.toggle("is-loading", !localWhisperReady);
+
+  updateRecordingUi();
+}
+
+function clampPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(100, Math.round(number)));
 }
 
 async function loadMicrophoneDevices(options = {}) {
@@ -751,6 +1110,39 @@ function renderNativeMicrophoneOptions() {
   elements.microphoneSelect.value = "";
   elements.microphoneSelect.disabled = true;
   elements.refreshDevicesButton.disabled = false;
+}
+
+function renderLocalWhisperMicrophoneOptions(devices = []) {
+  const savedDeviceId = localStorage.getItem(storageKeys.microphone) || "";
+  const currentDeviceId = /^\d+$/.test(savedDeviceId)
+    ? elements.microphoneSelect.value || savedDeviceId
+    : "";
+  const hasCurrent = devices.some(device => String(device.id) === currentDeviceId);
+
+  elements.microphoneSelect.innerHTML = "";
+  elements.microphoneSelect.append(new Option("系统默认麦克风", ""));
+  devices.forEach(device => {
+    const label = device.default ? `${device.name}（默认）` : device.name;
+    elements.microphoneSelect.append(new Option(label, String(device.id)));
+  });
+
+  elements.microphoneSelect.value = hasCurrent ? currentDeviceId : "";
+  elements.microphoneSelect.disabled = false;
+  elements.refreshDevicesButton.disabled = false;
+}
+
+function translateLocalWhisperMessage(message) {
+  const text = String(message || "").trim();
+
+  if (!text) return "本地 Whisper 出错";
+  if (text.includes("Local Whisper dependencies are missing")) {
+    return "本地 Whisper 依赖未安装，请运行 scripts\\setup-local-whisper.ps1";
+  }
+  if (text.includes("Recording is too short")) {
+    return "录音太短，请多说一点再停止";
+  }
+
+  return text;
 }
 
 function translateNativeSpeechMessage(message) {

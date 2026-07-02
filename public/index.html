@@ -52,6 +52,16 @@
             </button>
           </div>
 
+          <div class="engine-status is-hidden" id="engineStatus" aria-live="polite">
+            <div class="engine-status-head">
+              <span id="engineStatusText">正在准备本地 Whisper</span>
+              <strong id="engineStatusPercent">0%</strong>
+            </div>
+            <div class="engine-progress" aria-hidden="true">
+              <span id="engineProgressBar"></span>
+            </div>
+          </div>
+
           <div class="control-row">
             <button class="primary-action" id="recordButton" type="button">
               <span class="button-icon" id="recordButtonIcon" aria-hidden="true">

@@ -7,16 +7,24 @@ import { existsSync, readFileSync } from "node:fs";
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = resolve(__dirname, "public");
 const nativeDictationScript = resolve(__dirname, "scripts", "native-dictation.ps1");
+const localWhisperScript = resolve(__dirname, "scripts", "local-whisper-recorder.py");
+const localPythonPath = resolve(__dirname, ".venv", "Scripts", "python.exe");
 
 loadDotEnv(resolve(__dirname, ".env"));
 
 const port = Number(process.env.PORT || 47831);
 const host = process.env.HOST || "127.0.0.1";
 const defaultModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
+const defaultWhisperModel = process.env.WHISPER_MODEL || "large-v3";
+const defaultWhisperDevice = process.env.WHISPER_DEVICE || "cuda";
+const defaultWhisperComputeType = process.env.WHISPER_COMPUTE_TYPE || "float16";
 const deepseekEndpoint =
   process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/chat/completions";
 let nativeDictation = null;
 const nativeSpeechClients = new Set();
+let localWhisper = null;
+const localWhisperClients = new Set();
+let localWhisperShutdownTimer = null;
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -44,8 +52,34 @@ async function handleRequest(req, res) {
       return sendJson(res, 200, {
         hasServerKey: Boolean(process.env.DEEPSEEK_API_KEY),
         defaultModel,
-        nativeSpeech: getNativeSpeechStatus()
+        nativeSpeech: getNativeSpeechStatus(),
+        localWhisper: getLocalWhisperStatus()
       });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/local-whisper/status") {
+      return sendJson(res, 200, getLocalWhisperStatus());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/local-whisper/devices") {
+      return await handleLocalWhisperDevices(req, res);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/local-whisper/events") {
+      return handleLocalWhisperEvents(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/local-whisper/preload") {
+      return await handleLocalWhisperPreload(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/local-whisper/start") {
+      return await handleLocalWhisperStart(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/local-whisper/stop") {
+      stopLocalWhisperRecording();
+      return sendJson(res, 200, { ok: true });
     }
 
     if (req.method === "GET" && url.pathname === "/api/native-speech/status") {
@@ -101,6 +135,20 @@ server.listen(activePort, host, () => {
   if (activePort !== port) {
     console.log(`Port ${port} was busy, so this session is using ${activePort}.`);
   }
+});
+
+process.on("SIGINT", () => {
+  stopLocalWhisperWorker();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  stopLocalWhisperWorker();
+  process.exit(0);
+});
+
+process.on("exit", () => {
+  stopLocalWhisperWorker();
 });
 
 async function handleRefine(req, res) {
@@ -277,6 +325,367 @@ function handleNativeSpeechEvents(req, res) {
   });
 }
 
+async function handleLocalWhisperDevices(req, res) {
+  const status = getLocalWhisperStatus();
+  if (!status.available) {
+    return sendJson(res, 501, {
+      error: "本地 Whisper 环境未安装。请先运行 scripts\\setup-local-whisper.ps1。"
+    });
+  }
+
+  try {
+    const payload = await runLocalWhisperUtility(["--list-devices"]);
+    return sendJson(res, 200, { devices: payload.devices || [] });
+  } catch (error) {
+    return sendJson(res, 500, {
+      error: error instanceof Error ? error.message : "麦克风列表读取失败。"
+    });
+  }
+}
+
+async function handleLocalWhisperPreload(req, res) {
+  const status = getLocalWhisperStatus();
+  if (!status.available) {
+    return sendJson(res, 501, {
+      error: "本地 Whisper 环境未安装。请先运行 scripts\\setup-local-whisper.ps1。"
+    });
+  }
+
+  ensureLocalWhisperWorker();
+  return sendJson(res, 200, { ok: true, localWhisper: getLocalWhisperStatus() });
+}
+
+async function handleLocalWhisperStart(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return sendJson(res, 400, { error: "请求体不是有效的 JSON。" });
+  }
+
+  const status = getLocalWhisperStatus();
+  if (!status.available) {
+    return sendJson(res, 501, {
+      error: "本地 Whisper 环境未安装。请先运行 scripts\\setup-local-whisper.ps1。"
+    });
+  }
+
+  const worker = ensureLocalWhisperWorker();
+  if (!worker.ready) {
+    return sendJson(res, 409, {
+      error: "本地 Whisper 模型还在下载/加载，请等进度条完成。",
+      localWhisper: getLocalWhisperStatus()
+    });
+  }
+
+  if (worker.recording || worker.transcribing) {
+    return sendJson(res, 409, { error: "本地 Whisper 正在录音或转写。" });
+  }
+
+  sendLocalWhisperCommand({
+    type: "record",
+    language: normalizeWhisperLanguage(String(body.language || "zh-CN")),
+    inputDevice: body.inputDevice ?? null
+  });
+  return sendJson(res, 200, { ok: true });
+}
+
+function handleLocalWhisperEvents(req, res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-store",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  res.write("retry: 1000\n\n");
+
+  clearLocalWhisperShutdownTimer();
+  localWhisperClients.add(res);
+  sendLocalWhisperEvent(
+    {
+      type: "status",
+      message: "本地 Whisper 通道已连接。",
+      localWhisper: getLocalWhisperStatus()
+    },
+    res
+  );
+
+  if (localWhisper?.lastEvent) {
+    sendLocalWhisperEvent(localWhisper.lastEvent, res);
+  }
+
+  req.on("close", () => {
+    localWhisperClients.delete(res);
+    scheduleLocalWhisperShutdownIfIdle();
+  });
+}
+
+function ensureLocalWhisperWorker() {
+  if (localWhisper?.process && !localWhisper.process.killed) {
+    clearLocalWhisperShutdownTimer();
+    return localWhisper;
+  }
+
+  return startLocalWhisperWorker();
+}
+
+function startLocalWhisperWorker() {
+  const python = getLocalPythonPath();
+  const child = spawn(
+    python,
+    [
+      localWhisperScript,
+      "--model",
+      defaultWhisperModel,
+      "--language",
+      "zh",
+      "--device",
+      defaultWhisperDevice,
+      "--compute-type",
+      defaultWhisperComputeType
+    ],
+    {
+      cwd: __dirname,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        HF_HUB_DISABLE_SYMLINKS_WARNING: "1"
+      },
+      stdio: ["pipe", "pipe", "pipe"]
+    }
+  );
+
+  const session = {
+    process: child,
+    buffer: "",
+    model: defaultWhisperModel,
+    device: defaultWhisperDevice,
+    computeType: defaultWhisperComputeType,
+    ready: false,
+    loading: true,
+    recording: false,
+    transcribing: false,
+    progress: 0,
+    message: "正在启动本地 Whisper 引擎",
+    lastEvent: null
+  };
+  localWhisper = session;
+  sendLocalWhisperEvent({
+    type: "progress",
+    progress: 1,
+    message: session.message,
+    model: session.model,
+    device: session.device,
+    computeType: session.computeType
+  });
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", chunk => {
+    session.buffer += chunk;
+    let newlineIndex = session.buffer.indexOf("\n");
+
+    while (newlineIndex !== -1) {
+      const line = session.buffer.slice(0, newlineIndex).trim();
+      session.buffer = session.buffer.slice(newlineIndex + 1);
+      if (line) {
+        try {
+          handleLocalWhisperWorkerEvent(session, JSON.parse(line));
+        } catch {
+          handleLocalWhisperWorkerEvent(session, { type: "status", message: line });
+        }
+      }
+      newlineIndex = session.buffer.indexOf("\n");
+    }
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", chunk => {
+    const message = chunk.trim();
+    if (message && !isIgnorableWhisperWarning(message)) {
+      sendLocalWhisperEvent({ type: "warning", message });
+    }
+  });
+
+  child.on("error", error => {
+    handleLocalWhisperWorkerEvent(session, {
+      type: "error",
+      fatal: true,
+      message: error instanceof Error ? error.message : "本地 Whisper 启动失败。"
+    });
+  });
+
+  child.on("exit", (code, signal) => {
+    if (localWhisper === session) {
+      localWhisper = null;
+    }
+    sendLocalWhisperEvent({
+      type: "workerStopped",
+      code,
+      signal
+    });
+  });
+
+  return session;
+}
+
+function handleLocalWhisperWorkerEvent(session, event) {
+  const type = event?.type;
+
+  if (type === "progress") {
+    session.loading = true;
+    session.progress = clampProgress(event.progress);
+    session.message = event.message || session.message;
+    session.lastEvent = event;
+  } else if (type === "ready") {
+    session.ready = true;
+    session.loading = false;
+    session.progress = 100;
+    session.message = event.message || "本地 Whisper 已就绪";
+    session.lastEvent = event;
+  } else if (type === "recording") {
+    session.recording = true;
+    session.transcribing = false;
+  } else if (type === "transcribing") {
+    session.recording = false;
+    session.transcribing = true;
+  } else if (type === "result" || type === "idle") {
+    session.recording = false;
+    session.transcribing = false;
+  } else if (type === "error") {
+    session.recording = false;
+    session.transcribing = false;
+    if (event.fatal) {
+      session.ready = false;
+      session.loading = false;
+      session.message = event.message || "本地 Whisper 启动失败";
+      session.lastEvent = event;
+    }
+  } else if (type === "devices") {
+    session.devices = event.devices || [];
+  }
+
+  sendLocalWhisperEvent(event);
+}
+
+function isIgnorableWhisperWarning(message) {
+  return (
+    message.includes("HF_HUB_DISABLE_SYMLINKS_WARNING") ||
+    message.includes("HF_TOKEN") ||
+    message.includes("huggingface_hub") ||
+    message.includes("file_download.py")
+  );
+}
+
+function runLocalWhisperUtility(args) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(getLocalPythonPath(), [localWhisperScript, ...args], {
+      cwd: __dirname,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        HF_HUB_DISABLE_SYMLINKS_WARNING: "1"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", chunk => {
+      stdout += chunk;
+    });
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", chunk => {
+      stderr += chunk;
+    });
+
+    child.on("error", rejectPromise);
+    child.on("exit", code => {
+      if (code !== 0) {
+        rejectPromise(new Error(stderr.trim() || stdout.trim() || "本地 Whisper 工具执行失败。"));
+        return;
+      }
+
+      const line = stdout
+        .split(/\r?\n/)
+        .map(value => value.trim())
+        .filter(Boolean)
+        .at(-1);
+
+      if (!line) {
+        resolvePromise({});
+        return;
+      }
+
+      try {
+        resolvePromise(JSON.parse(line));
+      } catch {
+        rejectPromise(new Error(line));
+      }
+    });
+  });
+}
+
+function stopLocalWhisperRecording() {
+  if (!localWhisper?.process) return;
+
+  sendLocalWhisperCommand({ type: "stop" });
+}
+
+function sendLocalWhisperCommand(command) {
+  if (!localWhisper?.process || localWhisper.process.killed) return false;
+  if (!localWhisper.process.stdin.writable) return false;
+
+  localWhisper.process.stdin.write(`${JSON.stringify(command)}\n`);
+  return true;
+}
+
+function scheduleLocalWhisperShutdownIfIdle() {
+  clearLocalWhisperShutdownTimer();
+
+  localWhisperShutdownTimer = setTimeout(() => {
+    if (localWhisperClients.size > 0) return;
+    stopLocalWhisperWorker();
+  }, 5000);
+}
+
+function clearLocalWhisperShutdownTimer() {
+  if (localWhisperShutdownTimer) {
+    clearTimeout(localWhisperShutdownTimer);
+    localWhisperShutdownTimer = null;
+  }
+}
+
+function stopLocalWhisperWorker() {
+  if (!localWhisper?.process) return;
+
+  const child = localWhisper.process;
+  sendLocalWhisperCommand({ type: "shutdown" });
+
+  setTimeout(() => {
+    if (!child.killed) {
+      child.kill();
+    }
+  }, 1800);
+}
+
+function sendLocalWhisperEvent(payload, target = null) {
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  const clients = target ? [target] : localWhisperClients;
+
+  for (const client of clients) {
+    client.write(data);
+  }
+}
+
+function clampProgress(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(100, Math.round(number)));
+}
+
 function startNativeDictation(culture) {
   stopNativeDictation();
 
@@ -377,12 +786,43 @@ function getNativeSpeechStatus() {
   };
 }
 
+function getLocalWhisperStatus() {
+  const workerRunning = Boolean(localWhisper?.process && !localWhisper.process.killed);
+  return {
+    available: existsSync(localWhisperScript) && existsSync(getLocalPythonPath()),
+    installed: existsSync(getLocalPythonPath()),
+    defaultModel: defaultWhisperModel,
+    device: defaultWhisperDevice,
+    computeType: defaultWhisperComputeType,
+    workerRunning,
+    ready: Boolean(workerRunning && localWhisper.ready),
+    loading: Boolean(workerRunning && localWhisper.loading),
+    recording: Boolean(workerRunning && localWhisper.recording),
+    transcribing: Boolean(workerRunning && localWhisper.transcribing),
+    progress: workerRunning ? localWhisper.progress || 0 : 0,
+    message: workerRunning ? localWhisper.message || "" : "",
+    running: Boolean(workerRunning && localWhisper.recording)
+  };
+}
+
+function getLocalPythonPath() {
+  return process.env.WHISPER_PYTHON || localPythonPath;
+}
+
 function normalizeSpeechCulture(culture) {
   return {
     "zh-CN": "zh-CN",
     "zh-TW": "zh-CN",
     "en-US": "en-US"
   }[culture] || "zh-CN";
+}
+
+function normalizeWhisperLanguage(language) {
+  return {
+    "zh-CN": "zh",
+    "zh-TW": "zh",
+    "en-US": "en"
+  }[language] || "zh";
 }
 
 function buildMessages({ transcript, mode, density }) {
