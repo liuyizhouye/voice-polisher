@@ -6,7 +6,11 @@ const elements = {
   recordTimer: $("#recordTimer"),
   waveCanvas: $("#waveCanvas"),
   recordButton: $("#recordButton"),
+  recordButtonIcon: $("#recordButtonIcon"),
+  recordButtonLabel: $("#recordButtonLabel"),
   clearTranscriptButton: $("#clearTranscriptButton"),
+  microphoneSelect: $("#microphoneSelect"),
+  refreshDevicesButton: $("#refreshDevicesButton"),
   transcriptInput: $("#transcriptInput"),
   interimText: $("#interimText"),
   modeSelect: $("#modeSelect"),
@@ -34,13 +38,16 @@ const storageKeys = {
   history: "voice-polisher-history",
   apiKey: "voice-polisher-api-key",
   rememberKey: "voice-polisher-remember-key",
+  microphone: "voice-polisher-microphone",
   theme: "voice-polisher-theme"
 };
 
 let recognition = null;
+let recognitionState = "idle";
 let isRecording = false;
 let shouldRestart = false;
 let timerId = null;
+let recordingWatchdogId = null;
 let startedAt = 0;
 let audioContext = null;
 let audioStream = null;
@@ -56,6 +63,9 @@ async function init() {
   bindEvents();
   renderHistory();
   drawIdleWave();
+  await loadMicrophoneDevices().catch(() => {
+    elements.listenState.textContent = "麦克风待授权";
+  });
 
   if (window.lucide) {
     window.lucide.createIcons();
@@ -94,6 +104,34 @@ function bindEvents() {
     elements.interimText.textContent = "";
     showToast("已清空原始口述");
   });
+
+  elements.microphoneSelect.addEventListener("change", () => {
+    localStorage.setItem(storageKeys.microphone, elements.microphoneSelect.value);
+    if (isRecording) {
+      stopRecording();
+      window.setTimeout(startRecording, 350);
+      return;
+    }
+    elements.listenState.textContent = "麦克风已选择";
+  });
+
+  elements.refreshDevicesButton.addEventListener("click", async () => {
+    elements.refreshDevicesButton.disabled = true;
+    try {
+      await loadMicrophoneDevices({ requestPermission: true });
+      showToast("麦克风列表已刷新");
+    } catch (error) {
+      showToast(friendlyMicrophoneError(error));
+    } finally {
+      elements.refreshDevicesButton.disabled = false;
+    }
+  });
+
+  if (navigator.mediaDevices) {
+    navigator.mediaDevices.addEventListener?.("devicechange", () => {
+      loadMicrophoneDevices().catch(() => {});
+    });
+  }
 
   elements.languageSelect.addEventListener("change", () => {
     if (!isRecording) return;
@@ -141,28 +179,39 @@ async function startRecording() {
   }
 
   try {
-    recognition = createRecognition();
+    stopRecordingWatchdog();
     shouldRestart = true;
     isRecording = true;
+    recognitionState = "starting";
     startedAt = Date.now();
     updateRecordingUi();
+    elements.listenState.textContent = "正在请求麦克风权限";
     startTimer();
-    await startAudioMeter();
+
+    recognition = createRecognition();
     recognition.start();
-    elements.listenState.textContent = "正在记录";
+    startRecordingWatchdog();
+    startAudioMeter().catch(error => {
+      if (!isRecording) return;
+      elements.listenState.textContent = friendlyMicrophoneError(error);
+      showToast(friendlyMicrophoneError(error));
+    });
   } catch (error) {
     isRecording = false;
     shouldRestart = false;
+    recognitionState = "idle";
     updateRecordingUi();
     stopTimer();
+    stopRecordingWatchdog();
     stopAudioMeter();
-    showToast(error?.message || "录音启动失败");
+    showToast(error?.message || friendlyMicrophoneError(error));
   }
 }
 
 function stopRecording() {
   shouldRestart = false;
   isRecording = false;
+  recognitionState = "idle";
   elements.interimText.textContent = "";
 
   if (recognition) {
@@ -175,6 +224,7 @@ function stopRecording() {
 
   updateRecordingUi();
   stopTimer();
+  stopRecordingWatchdog();
   stopAudioMeter();
   elements.listenState.textContent = "已暂停";
 }
@@ -184,6 +234,27 @@ function createRecognition() {
   instance.continuous = true;
   instance.interimResults = true;
   instance.lang = elements.languageSelect.value;
+
+  instance.onstart = () => {
+    recognitionState = "started";
+    elements.listenState.textContent = "正在听写";
+  };
+
+  instance.onaudiostart = () => {
+    recognitionState = "audio";
+    elements.listenState.textContent = "麦克风已打开";
+  };
+
+  instance.onspeechstart = () => {
+    recognitionState = "speech";
+    elements.listenState.textContent = "正在识别语音";
+  };
+
+  instance.onspeechend = () => {
+    if (isRecording) {
+      elements.listenState.textContent = "等待继续说话";
+    }
+  };
 
   instance.onresult = event => {
     let finalText = "";
@@ -201,6 +272,7 @@ function createRecognition() {
     }
 
     if (finalText) {
+      recognitionState = "result";
       elements.transcriptInput.value = joinSpeech(
         elements.transcriptInput.value,
         finalText
@@ -212,17 +284,30 @@ function createRecognition() {
 
   instance.onerror = event => {
     const messages = {
-      "not-allowed": "麦克风权限被拒绝",
+      "not-allowed": "麦克风权限被拒绝，请在浏览器或系统设置里允许麦克风",
       "audio-capture": "没有检测到麦克风",
+      "service-not-allowed": "浏览器听写服务不可用",
+      "language-not-supported": "当前语言不支持听写",
       network: "听写网络不可用",
       "no-speech": "没有识别到语音"
     };
-    elements.listenState.textContent = messages[event.error] || "听写出现错误";
-    if (event.error === "not-allowed" || event.error === "audio-capture") {
+    const message = messages[event.error] || "听写出现错误";
+    elements.listenState.textContent = message;
+    if (event.error !== "no-speech") {
+      showToast(message);
+    }
+    if (
+      event.error === "not-allowed" ||
+      event.error === "audio-capture" ||
+      event.error === "service-not-allowed" ||
+      event.error === "language-not-supported"
+    ) {
       shouldRestart = false;
       isRecording = false;
+      recognitionState = "idle";
       updateRecordingUi();
       stopTimer();
+      stopRecordingWatchdog();
       stopAudioMeter();
     }
   };
@@ -237,8 +322,10 @@ function createRecognition() {
         } catch {
           shouldRestart = false;
           isRecording = false;
+          recognitionState = "idle";
           updateRecordingUi();
           stopTimer();
+          stopRecordingWatchdog();
           stopAudioMeter();
           elements.listenState.textContent = "听写已停止";
         }
@@ -256,15 +343,37 @@ async function startAudioMeter() {
   }
 
   try {
-    audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioStream = await getMicrophoneStream();
     audioContext = new AudioContext();
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 1024;
     const source = audioContext.createMediaStreamSource(audioStream);
     source.connect(analyser);
     drawLiveWave();
-  } catch {
-    drawSyntheticWave();
+    await loadMicrophoneDevices();
+  } catch (error) {
+    throw new Error(friendlyMicrophoneError(error));
+  }
+}
+
+async function getMicrophoneStream() {
+  const selectedDeviceId = elements.microphoneSelect.value;
+
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: selectedDeviceId
+        ? { deviceId: { exact: selectedDeviceId } }
+        : true
+    });
+  } catch (error) {
+    if (!selectedDeviceId) {
+      throw error;
+    }
+
+    localStorage.removeItem(storageKeys.microphone);
+    elements.microphoneSelect.value = "";
+    showToast("选中的麦克风不可用，已切回系统默认");
+    return await navigator.mediaDevices.getUserMedia({ audio: true });
   }
 }
 
@@ -364,10 +473,33 @@ function getCanvasColor(name) {
 
 function updateRecordingUi() {
   elements.recordButton.classList.toggle("is-recording", isRecording);
-  elements.recordButton.querySelector("span").textContent = isRecording ? "暂停" : "开始";
-  const icon = elements.recordButton.querySelector("i");
-  icon.setAttribute("data-lucide", isRecording ? "pause" : "mic");
+  elements.recordButtonLabel.textContent = isRecording ? "暂停" : "开始";
+  elements.recordButtonIcon.innerHTML = `<i data-lucide="${isRecording ? "pause" : "mic"}"></i>`;
   if (window.lucide) window.lucide.createIcons();
+}
+
+function startRecordingWatchdog() {
+  stopRecordingWatchdog();
+  recordingWatchdogId = window.setTimeout(() => {
+    if (!isRecording) return;
+
+    if (recognitionState === "starting") {
+      elements.listenState.textContent = "浏览器听写没有响应，请检查麦克风权限";
+      showToast("浏览器听写没有响应，请检查麦克风权限");
+      return;
+    }
+
+    if (recognitionState === "started") {
+      elements.listenState.textContent = "听写已启动，等待麦克风声音";
+    }
+  }, 4500);
+}
+
+function stopRecordingWatchdog() {
+  if (recordingWatchdogId) {
+    window.clearTimeout(recordingWatchdogId);
+    recordingWatchdogId = null;
+  }
 }
 
 function startTimer() {
@@ -389,6 +521,68 @@ function stopTimer() {
   if (!isRecording) {
     elements.recordTimer.textContent = "00:00";
   }
+}
+
+async function loadMicrophoneDevices(options = {}) {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    elements.microphoneSelect.disabled = true;
+    elements.refreshDevicesButton.disabled = true;
+    return;
+  }
+
+  let probeStream = null;
+  if (options.requestPermission && navigator.mediaDevices.getUserMedia) {
+    probeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  }
+
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    renderMicrophoneOptions(devices.filter(device => device.kind === "audioinput"));
+  } finally {
+    if (probeStream) {
+      probeStream.getTracks().forEach(track => track.stop());
+    }
+  }
+}
+
+function renderMicrophoneOptions(devices) {
+  const savedDeviceId = localStorage.getItem(storageKeys.microphone) || "";
+  const currentDeviceId = elements.microphoneSelect.value || savedDeviceId;
+  const hasCurrent = devices.some(device => device.deviceId === currentDeviceId);
+
+  elements.microphoneSelect.innerHTML = "";
+  elements.microphoneSelect.append(new Option("系统默认麦克风", ""));
+
+  devices.forEach((device, index) => {
+    const label = device.label || `麦克风 ${index + 1}`;
+    elements.microphoneSelect.append(new Option(label, device.deviceId));
+  });
+
+  elements.microphoneSelect.value = hasCurrent ? currentDeviceId : "";
+  elements.microphoneSelect.disabled = devices.length === 0;
+
+  if (!devices.length) {
+    elements.listenState.textContent = "没有检测到麦克风";
+  } else if (!hasCurrent && currentDeviceId) {
+    localStorage.removeItem(storageKeys.microphone);
+  }
+}
+
+function friendlyMicrophoneError(error) {
+  const name = error?.name || "";
+  const messages = {
+    NotAllowedError: "麦克风权限被拒绝，请在浏览器或系统设置里允许麦克风",
+    SecurityError: "麦克风权限被拒绝，请在浏览器或系统设置里允许麦克风",
+    NotFoundError: "没有检测到麦克风",
+    DevicesNotFoundError: "没有检测到麦克风",
+    NotReadableError: "麦克风被占用或无法启动",
+    TrackStartError: "麦克风被占用或无法启动",
+    OverconstrainedError: "选中的麦克风不可用",
+    ConstraintNotSatisfiedError: "选中的麦克风不可用",
+    AbortError: "麦克风启动被中断"
+  };
+
+  return messages[name] || error?.message || "麦克风启动失败";
 }
 
 async function refineTranscript() {

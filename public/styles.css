@@ -200,6 +200,22 @@ body.dark .brand-mark {
   margin: 14px 0 16px;
 }
 
+.microphone-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin: 14px 0 0;
+}
+
+.microphone-field span {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .primary-action,
 .ghost-action,
 .refine-button,
@@ -254,6 +270,14 @@ body.dark .brand-mark {
   background: var(--panel);
   border: 1px solid var(--line);
   color: var(--text);
+}
+
+.button-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
 }
 
 button:disabled {
@@ -491,6 +515,7 @@ svg {
   }
 
   .settings-grid,
+  .microphone-row,
   .key-row,
   .history-list {
     grid-template-columns: 1fr;

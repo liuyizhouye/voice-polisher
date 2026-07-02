@@ -40,10 +40,24 @@
 
           <canvas class="wave-canvas" id="waveCanvas" width="1100" height="230"></canvas>
 
+          <div class="microphone-row">
+            <label class="microphone-field">
+              <span>输入麦克风</span>
+              <select id="microphoneSelect">
+                <option value="">系统默认麦克风</option>
+              </select>
+            </label>
+            <button class="icon-button" id="refreshDevicesButton" type="button" title="刷新麦克风">
+              <i data-lucide="refresh-cw"></i>
+            </button>
+          </div>
+
           <div class="control-row">
             <button class="primary-action" id="recordButton" type="button">
-              <i data-lucide="mic"></i>
-              <span>开始</span>
+              <span class="button-icon" id="recordButtonIcon" aria-hidden="true">
+                <i data-lucide="mic"></i>
+              </span>
+              <span id="recordButtonLabel">开始</span>
             </button>
             <button class="ghost-action" id="clearTranscriptButton" type="button">
               <i data-lucide="trash-2"></i>

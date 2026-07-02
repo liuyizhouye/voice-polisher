@@ -103,6 +103,14 @@ async function handleRefine(req, res) {
     return sendJson(res, 413, { error: "内容太长，请分段整理。" });
   }
 
+  if (shouldReturnLiteral(transcript)) {
+    return sendJson(res, 200, {
+      refined: transcript,
+      model,
+      guarded: true
+    });
+  }
+
   if (!apiKey) {
     return sendJson(res, 401, {
       error: "缺少 DeepSeek API key。请在 .env 中设置，或在页面设置里临时填写。"
@@ -118,8 +126,8 @@ async function handleRefine(req, res) {
     body: JSON.stringify({
       model,
       thinking: { type: "disabled" },
-      temperature: 0.25,
-      max_tokens: 4096,
+      temperature: 0,
+      max_tokens: getMaxTokensForTranscript(transcript),
       messages: buildMessages({ transcript, mode, density })
     })
   });
@@ -141,9 +149,12 @@ async function handleRefine(req, res) {
     return sendJson(res, 502, { error: "DeepSeek 没有返回可用内容。" });
   }
 
+  const guardedRefined = guardRefinedOutput(transcript, refined);
+
   return sendJson(res, 200, {
-    refined,
-    model: data?.model || model
+    refined: guardedRefined,
+    model: data?.model || model,
+    guarded: guardedRefined !== refined
   });
 }
 
@@ -205,7 +216,7 @@ async function handleTestKey(req, res) {
 
 function buildMessages({ transcript, mode, density }) {
   const modeNames = {
-    daily: "个人日记或自我记录",
+    daily: "普通口述记录",
     work: "工作记录",
     todo: "待办清单",
     formal: "正式表达"
@@ -221,13 +232,16 @@ function buildMessages({ transcript, mode, density }) {
     {
       role: "system",
       content: [
-        "你是一个中文口述整理助手。你的任务是把用户随口说出的内容整理成他真正想表达的话。",
+        "你是一个中文口述忠实整理助手。你的任务是只整理用户已经说出的内容。",
+        "这是忠实改写，不是续写、创作、补全、日记生成或内容生成。",
         "规则：",
         "1. 删除重复、停顿词、口头禅、绕远的话和无意义补充。",
         "2. 保留事实、数字、人物、时间、情绪、判断、原因、结论和行动项。",
-        "3. 不编造信息，不添加用户没有表达过的新观点。",
-        "4. 如果原文信息不完整，用自然中文保留不确定性。",
-        "5. 输出只给整理后的正文，不要解释你的处理过程。"
+        "3. 严禁编造原文没有出现的日期、地点、人物、事件、动作、情绪或细节。",
+        "4. 如果原文只有数字、符号、乱码、单个词或信息不足，必须原样输出，不要解释。",
+        "5. 如果原文信息不完整，用原文已有信息自然表达，不要补齐背景。",
+        "6. 输出信息量不得超过原文；通常只做断句、去口头禅和轻微顺句。",
+        "7. 输出只给整理后的正文，不要解释你的处理过程。"
       ].join("\n")
     },
     {
@@ -236,11 +250,56 @@ function buildMessages({ transcript, mode, density }) {
         `整理场景：${modeNames[mode] || modeNames.daily}`,
         `详略要求：${densityRules[density] || densityRules.balanced}`,
         "",
-        "原始口述：",
-        transcript
+        "只整理以下分隔符内的原始口述，不要使用任何外部上下文：",
+        "<<<原始口述",
+        transcript,
+        "原始口述>>>"
       ].join("\n")
     }
   ];
+}
+
+function shouldReturnLiteral(transcript) {
+  const compact = transcript.replace(/\s+/g, "");
+  if (!compact) return true;
+
+  const meaningfulCount = countMeaningfulChars(compact);
+  const hasLetter = /\p{L}/u.test(compact);
+  const onlyNumbersAndSymbols = /^[\p{N}\p{P}\p{S}]+$/u.test(compact);
+
+  return (
+    meaningfulCount <= 4 ||
+    (!hasLetter && onlyNumbersAndSymbols) ||
+    /^(.{1,3})\1{2,}$/u.test(compact)
+  );
+}
+
+function guardRefinedOutput(transcript, refined) {
+  if (isUnsafeExpansion(transcript, refined)) {
+    return transcript;
+  }
+
+  return refined;
+}
+
+function isUnsafeExpansion(transcript, refined) {
+  const inputLength = countMeaningfulChars(transcript);
+  const outputLength = countMeaningfulChars(refined);
+
+  if (inputLength <= 4) return refined.trim() !== transcript.trim();
+  if (inputLength <= 12) return outputLength > inputLength + 20;
+  if (inputLength <= 40) return outputLength > Math.max(inputLength * 4, inputLength + 60);
+
+  return outputLength > Math.max(inputLength * 3, inputLength + 240);
+}
+
+function countMeaningfulChars(value) {
+  return Array.from(String(value)).filter(char => /[\p{L}\p{N}]/u.test(char)).length;
+}
+
+function getMaxTokensForTranscript(transcript) {
+  const length = countMeaningfulChars(transcript);
+  return Math.min(4096, Math.max(64, Math.ceil(length * 3.2 + 80)));
 }
 
 function serveStatic(pathname, res) {
