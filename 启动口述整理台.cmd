@@ -1,3 +1,4 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0launcher.ps1"
+start "" wscript.exe "%~dp0start-voice-polisher.vbs"
+exit /b
