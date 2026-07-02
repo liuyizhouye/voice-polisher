@@ -44,6 +44,9 @@ const storageKeys = {
 
 let recognition = null;
 let recognitionState = "idle";
+let nativeSpeech = { available: false };
+let nativeEventSource = null;
+let activeRecorder = "browser";
 let isRecording = false;
 let shouldRestart = false;
 let timerId = null;
@@ -63,30 +66,37 @@ async function init() {
   bindEvents();
   renderHistory();
   drawIdleWave();
-  await loadMicrophoneDevices().catch(() => {
-    elements.listenState.textContent = "麦克风待授权";
-  });
 
   if (window.lucide) {
     window.lucide.createIcons();
   }
 
-  if (!SpeechRecognition) {
-    elements.supportStatus.textContent = "当前浏览器不支持听写";
-    elements.listenState.textContent = "可直接输入文本";
-    elements.recordButton.disabled = true;
-  } else {
-    elements.supportStatus.textContent = "听写可用";
-  }
-
   try {
     const response = await fetch("/api/health");
     const health = await response.json();
+    nativeSpeech = health.nativeSpeech || { available: false };
     elements.modelInput.value = health.defaultModel || "deepseek-v4-flash";
     elements.modelChip.textContent = elements.modelInput.value;
     elements.modelStatus.textContent = health.hasServerKey ? "DeepSeek 已配置" : "等待 API key";
   } catch {
     elements.modelStatus.textContent = "本地服务未响应";
+  }
+
+  if (nativeSpeech.available) {
+    activeRecorder = "native";
+    elements.supportStatus.textContent = "Windows 系统听写可用";
+    elements.listenState.textContent = "准备使用系统麦克风";
+    renderNativeMicrophoneOptions();
+  } else if (SpeechRecognition) {
+    activeRecorder = "browser";
+    elements.supportStatus.textContent = "浏览器听写可用";
+    await loadMicrophoneDevices().catch(() => {
+      elements.listenState.textContent = "麦克风待授权";
+    });
+  } else {
+    elements.supportStatus.textContent = "当前环境不支持听写";
+    elements.listenState.textContent = "可直接输入文本";
+    elements.recordButton.disabled = true;
   }
 }
 
@@ -106,6 +116,11 @@ function bindEvents() {
   });
 
   elements.microphoneSelect.addEventListener("change", () => {
+    if (nativeSpeech.available) {
+      elements.listenState.textContent = "系统听写使用 Windows 默认麦克风";
+      return;
+    }
+
     localStorage.setItem(storageKeys.microphone, elements.microphoneSelect.value);
     if (isRecording) {
       stopRecording();
@@ -116,6 +131,12 @@ function bindEvents() {
   });
 
   elements.refreshDevicesButton.addEventListener("click", async () => {
+    if (nativeSpeech.available) {
+      showToast("系统听写使用 Windows 默认麦克风");
+      elements.listenState.textContent = "请在 Windows 声音设置里切换默认输入设备";
+      return;
+    }
+
     elements.refreshDevicesButton.disabled = true;
     try {
       await loadMicrophoneDevices({ requestPermission: true });
@@ -173,6 +194,10 @@ function bindEvents() {
 }
 
 async function startRecording() {
+  if (nativeSpeech.available) {
+    return await startNativeRecording();
+  }
+
   if (!SpeechRecognition) {
     showToast("当前浏览器不支持听写");
     return;
@@ -209,6 +234,11 @@ async function startRecording() {
 }
 
 function stopRecording() {
+  if (activeRecorder === "native") {
+    stopNativeRecording();
+    return;
+  }
+
   shouldRestart = false;
   isRecording = false;
   recognitionState = "idle";
@@ -227,6 +257,153 @@ function stopRecording() {
   stopRecordingWatchdog();
   stopAudioMeter();
   elements.listenState.textContent = "已暂停";
+}
+
+async function startNativeRecording() {
+  try {
+    activeRecorder = "native";
+    isRecording = true;
+    recognitionState = "starting";
+    startedAt = Date.now();
+    updateRecordingUi();
+    startTimer();
+    drawSyntheticWave();
+    await openNativeSpeechEvents();
+    elements.listenState.textContent = "正在启动 Windows 系统听写";
+
+    const response = await fetch("/api/native-speech/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ culture: elements.languageSelect.value })
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(payload.error || "系统听写启动失败");
+    }
+  } catch (error) {
+    isRecording = false;
+    recognitionState = "idle";
+    updateRecordingUi();
+    stopTimer();
+    stopAudioMeter();
+    closeNativeSpeechEvents();
+    elements.listenState.textContent = "系统听写启动失败";
+    showToast(error?.message || "系统听写启动失败");
+  }
+}
+
+async function stopNativeRecording() {
+  isRecording = false;
+  recognitionState = "idle";
+  elements.interimText.textContent = "";
+  updateRecordingUi();
+  stopTimer();
+  stopAudioMeter();
+  closeNativeSpeechEvents();
+  elements.listenState.textContent = "已暂停";
+
+  await fetch("/api/native-speech/stop", { method: "POST" }).catch(() => {});
+}
+
+function openNativeSpeechEvents() {
+  closeNativeSpeechEvents();
+  return new Promise(resolve => {
+    let resolved = false;
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      resolve();
+    };
+
+    nativeEventSource = new EventSource("/api/native-speech/events");
+    nativeEventSource.onopen = finish;
+
+    nativeEventSource.onmessage = event => {
+      try {
+        handleNativeSpeechEvent(JSON.parse(event.data));
+      } catch {
+        // Ignore malformed diagnostic messages.
+      }
+    };
+
+    nativeEventSource.onerror = () => {
+      finish();
+      if (!isRecording || activeRecorder !== "native") return;
+      elements.listenState.textContent = "系统听写连接中断";
+    };
+
+    window.setTimeout(finish, 500);
+  });
+}
+
+function closeNativeSpeechEvents() {
+  if (nativeEventSource) {
+    nativeEventSource.close();
+    nativeEventSource = null;
+  }
+}
+
+function handleNativeSpeechEvent(event) {
+  if (!event?.type) return;
+
+  if (event.type === "ready") {
+    recognitionState = "started";
+    elements.listenState.textContent = "Windows 系统听写已启动";
+    elements.supportStatus.textContent = event.recognizer || "Windows 系统听写可用";
+    return;
+  }
+
+  if (event.type === "audio") {
+    elements.listenState.textContent =
+      event.state === "Silence" ? "等待你说话" : "正在听";
+    return;
+  }
+
+  if (event.type === "hypothesis") {
+    elements.interimText.textContent = event.text || "";
+    return;
+  }
+
+  if (event.type === "result") {
+    const text = String(event.text || "").trim();
+    if (!text) return;
+    recognitionState = "result";
+    elements.transcriptInput.value = joinSpeech(elements.transcriptInput.value, text);
+    elements.interimText.textContent = "";
+    elements.listenState.textContent = "已识别一段语音";
+    return;
+  }
+
+  if (event.type === "rejected") {
+    elements.listenState.textContent = "没有识别出清晰语音";
+    return;
+  }
+
+  if (event.type === "error") {
+    const message = translateNativeSpeechMessage(event.message);
+    isRecording = false;
+    recognitionState = "idle";
+    updateRecordingUi();
+    stopTimer();
+    stopAudioMeter();
+    closeNativeSpeechEvents();
+    elements.listenState.textContent = message;
+    showToast(message);
+    return;
+  }
+
+  if (event.type === "stopped") {
+    if (activeRecorder === "native" && isRecording) {
+      isRecording = false;
+      recognitionState = "idle";
+      updateRecordingUi();
+      stopTimer();
+      stopAudioMeter();
+      closeNativeSpeechEvents();
+      elements.listenState.textContent = "系统听写已停止";
+    }
+  }
 }
 
 function createRecognition() {
@@ -284,7 +461,7 @@ function createRecognition() {
 
   instance.onerror = event => {
     const messages = {
-      "not-allowed": "麦克风权限被拒绝，请在浏览器或系统设置里允许麦克风",
+      "not-allowed": "麦克风权限被拒绝，请在这个应用窗口或系统设置里允许麦克风",
       "audio-capture": "没有检测到麦克风",
       "service-not-allowed": "浏览器听写服务不可用",
       "language-not-supported": "当前语言不支持听写",
@@ -484,8 +661,8 @@ function startRecordingWatchdog() {
     if (!isRecording) return;
 
     if (recognitionState === "starting") {
-      elements.listenState.textContent = "浏览器听写没有响应，请检查麦克风权限";
-      showToast("浏览器听写没有响应，请检查麦克风权限");
+      elements.listenState.textContent = "浏览器听写没有响应，请检查这个应用窗口的麦克风权限";
+      showToast("浏览器听写没有响应，请检查这个应用窗口的麦克风权限");
       return;
     }
 
@@ -568,11 +745,30 @@ function renderMicrophoneOptions(devices) {
   }
 }
 
+function renderNativeMicrophoneOptions() {
+  elements.microphoneSelect.innerHTML = "";
+  elements.microphoneSelect.append(new Option("Windows 默认麦克风", ""));
+  elements.microphoneSelect.value = "";
+  elements.microphoneSelect.disabled = true;
+  elements.refreshDevicesButton.disabled = false;
+}
+
+function translateNativeSpeechMessage(message) {
+  const text = String(message || "").trim();
+
+  if (!text) return "系统听写出错";
+  if (text.includes("No Windows speech recognizer")) {
+    return "Windows 没有安装当前语言的系统听写引擎";
+  }
+
+  return text;
+}
+
 function friendlyMicrophoneError(error) {
   const name = error?.name || "";
   const messages = {
-    NotAllowedError: "麦克风权限被拒绝，请在浏览器或系统设置里允许麦克风",
-    SecurityError: "麦克风权限被拒绝，请在浏览器或系统设置里允许麦克风",
+    NotAllowedError: "麦克风权限被拒绝，请在这个应用窗口或系统设置里允许麦克风",
+    SecurityError: "麦克风权限被拒绝，请在这个应用窗口或系统设置里允许麦克风",
     NotFoundError: "没有检测到麦克风",
     DevicesNotFoundError: "没有检测到麦克风",
     NotReadableError: "麦克风被占用或无法启动",

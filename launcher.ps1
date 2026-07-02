@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $appDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $hostAddress = "127.0.0.1"
+$preferredPort = 47831
 
 function Show-Message {
     param(
@@ -41,7 +42,7 @@ function Test-PortAvailable {
 }
 
 function Find-AvailablePort {
-    foreach ($candidate in 5173..5199) {
+    foreach ($candidate in $preferredPort..($preferredPort + 18)) {
         if (Test-PortAvailable -Port $candidate) {
             return $candidate
         }
@@ -193,7 +194,7 @@ try {
 
     $port = Find-AvailablePort
     if (-not $port) {
-        Show-Message "No available local port was found between 5173 and 5199. Close another local service and try again."
+        Show-Message "No available local port was found between $preferredPort and $($preferredPort + 18). Close another local service and try again."
         exit 1
     }
 

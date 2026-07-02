@@ -1,18 +1,22 @@
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = resolve(__dirname, "public");
+const nativeDictationScript = resolve(__dirname, "scripts", "native-dictation.ps1");
 
 loadDotEnv(resolve(__dirname, ".env"));
 
-const port = Number(process.env.PORT || 5173);
+const port = Number(process.env.PORT || 47831);
 const host = process.env.HOST || "127.0.0.1";
 const defaultModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 const deepseekEndpoint =
   process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/chat/completions";
+let nativeDictation = null;
+const nativeSpeechClients = new Set();
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -39,8 +43,26 @@ async function handleRequest(req, res) {
     if (req.method === "GET" && url.pathname === "/api/health") {
       return sendJson(res, 200, {
         hasServerKey: Boolean(process.env.DEEPSEEK_API_KEY),
-        defaultModel
+        defaultModel,
+        nativeSpeech: getNativeSpeechStatus()
       });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/native-speech/status") {
+      return sendJson(res, 200, getNativeSpeechStatus());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/native-speech/events") {
+      return handleNativeSpeechEvents(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/native-speech/start") {
+      return await handleNativeSpeechStart(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/native-speech/stop") {
+      stopNativeDictation();
+      return sendJson(res, 200, { ok: true });
     }
 
     if (req.method === "POST" && url.pathname === "/api/refine") {
@@ -212,6 +234,155 @@ async function handleTestKey(req, res) {
     ok: true,
     model: data?.model || model
   });
+}
+
+async function handleNativeSpeechStart(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return sendJson(res, 400, { error: "请求体不是有效的 JSON。" });
+  }
+
+  const culture = normalizeSpeechCulture(String(body.culture || "zh-CN"));
+
+  if (!getNativeSpeechStatus().available) {
+    return sendJson(res, 501, {
+      error: "当前系统不支持本地听写。"
+    });
+  }
+
+  if (nativeDictation?.process && !nativeDictation.process.killed) {
+    return sendJson(res, 200, { ok: true, alreadyRunning: true });
+  }
+
+  startNativeDictation(culture);
+  return sendJson(res, 200, { ok: true });
+}
+
+function handleNativeSpeechEvents(req, res) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-store",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  res.write("retry: 1000\n\n");
+
+  nativeSpeechClients.add(res);
+  sendNativeSpeechEvent({ type: "status", message: "系统听写通道已连接。" }, res);
+
+  req.on("close", () => {
+    nativeSpeechClients.delete(res);
+  });
+}
+
+function startNativeDictation(culture) {
+  stopNativeDictation();
+
+  const child = spawn(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      nativeDictationScript,
+      "-Culture",
+      culture
+    ],
+    {
+      cwd: __dirname,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    }
+  );
+
+  const dictationState = {
+    process: child,
+    buffer: ""
+  };
+  nativeDictation = dictationState;
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", chunk => {
+    dictationState.buffer += chunk;
+    let newlineIndex = dictationState.buffer.indexOf("\n");
+
+    while (newlineIndex !== -1) {
+      const line = dictationState.buffer.slice(0, newlineIndex).trim();
+      dictationState.buffer = dictationState.buffer.slice(newlineIndex + 1);
+      if (line) {
+        try {
+          sendNativeSpeechEvent(JSON.parse(line));
+        } catch {
+          sendNativeSpeechEvent({ type: "status", message: line });
+        }
+      }
+      newlineIndex = dictationState.buffer.indexOf("\n");
+    }
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", chunk => {
+    const message = chunk.trim();
+    if (message) {
+      sendNativeSpeechEvent({ type: "error", message });
+    }
+  });
+
+  child.on("error", error => {
+    sendNativeSpeechEvent({
+      type: "error",
+      message: error instanceof Error ? error.message : "系统听写启动失败。"
+    });
+  });
+
+  child.on("exit", (code, signal) => {
+    sendNativeSpeechEvent({
+      type: "stopped",
+      code,
+      signal
+    });
+    nativeDictation = null;
+  });
+}
+
+function stopNativeDictation() {
+  if (!nativeDictation?.process) return;
+
+  const child = nativeDictation.process;
+  nativeDictation = null;
+
+  if (!child.killed) {
+    child.kill();
+  }
+}
+
+function sendNativeSpeechEvent(payload, target = null) {
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  const clients = target ? [target] : nativeSpeechClients;
+
+  for (const client of clients) {
+    client.write(data);
+  }
+}
+
+function getNativeSpeechStatus() {
+  return {
+    available: process.platform === "win32" && existsSync(nativeDictationScript),
+    defaultCulture: "zh-CN",
+    usesSystemMicrophone: true,
+    running: Boolean(nativeDictation?.process && !nativeDictation.process.killed)
+  };
+}
+
+function normalizeSpeechCulture(culture) {
+  return {
+    "zh-CN": "zh-CN",
+    "zh-TW": "zh-CN",
+    "en-US": "en-US"
+  }[culture] || "zh-CN";
 }
 
 function buildMessages({ transcript, mode, density }) {
