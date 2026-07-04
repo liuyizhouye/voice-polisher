@@ -90,7 +90,7 @@
           <div class="panel-head">
             <div>
               <h2 id="resultTitle">整理结果</h2>
-              <p id="modelStatus">DeepSeek 未连接</p>
+              <p id="modelStatus">模型未连接</p>
             </div>
             <span class="model-pill" id="modelChip">deepseek-v4-flash</span>
           </div>
@@ -122,8 +122,13 @@
               </select>
             </label>
             <label>
+              <span>服务商</span>
+              <select id="providerSelect"></select>
+            </label>
+            <label>
               <span>模型</span>
-              <input id="modelInput" type="text" autocomplete="off" value="deepseek-v4-flash" />
+              <input id="modelInput" type="text" autocomplete="off" list="modelOptions" value="deepseek-v4-flash" />
+              <datalist id="modelOptions"></datalist>
             </label>
           </div>
 
@@ -146,6 +151,16 @@
               <span>连接</span>
             </button>
           </div>
+
+          <label class="key-field endpoint-field">
+            <span>API 地址</span>
+            <input
+              id="apiEndpointInput"
+              type="url"
+              autocomplete="off"
+              placeholder="https://api.example.com/v1/chat/completions"
+            />
+          </label>
 
           <button class="refine-button" id="refineButton" type="button">
             <i data-lucide="sparkles"></i>

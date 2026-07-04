@@ -5,21 +5,25 @@ import { fileURLToPath } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const publicDir = resolve(__dirname, "public");
-const nativeDictationScript = resolve(__dirname, "scripts", "native-dictation.ps1");
-const localWhisperScript = resolve(__dirname, "scripts", "local-whisper-recorder.py");
-const localPythonPath = resolve(__dirname, ".venv", "Scripts", "python.exe");
+const sourceDir = resolve(__dirname);
+const projectDir = resolve(process.env.VOICE_POLISHER_PROJECT_DIR || sourceDir);
+const publicDir = resolve(sourceDir, "public");
+const nativeDictationScript = resolve(sourceDir, "scripts", "native-dictation.ps1");
+const localWhisperScript = resolve(sourceDir, "scripts", "local-whisper-recorder.py");
+const projectPythonPath = resolve(projectDir, ".venv", "Scripts", "python.exe");
+const sourcePythonPath = resolve(sourceDir, ".venv", "Scripts", "python.exe");
 
-loadDotEnv(resolve(__dirname, ".env"));
+loadDotEnv(resolve(projectDir, ".env"));
+if (projectDir !== sourceDir) {
+  loadDotEnv(resolve(sourceDir, ".env"));
+}
 
 const port = Number(process.env.PORT || 47831);
 const host = process.env.HOST || "127.0.0.1";
-const defaultModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
-const defaultWhisperModel = process.env.WHISPER_MODEL || "large-v3";
+const defaultProviderId = process.env.AI_PROVIDER || "deepseek";
+const defaultWhisperModel = process.env.WHISPER_MODEL || "small";
 const defaultWhisperDevice = process.env.WHISPER_DEVICE || "cuda";
 const defaultWhisperComputeType = process.env.WHISPER_COMPUTE_TYPE || "float16";
-const deepseekEndpoint =
-  process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/chat/completions";
 let nativeDictation = null;
 const nativeSpeechClients = new Set();
 let localWhisper = null;
@@ -36,6 +40,123 @@ const contentTypes = {
   ".ico": "image/x-icon"
 };
 
+const providerPresets = {
+  deepseek: {
+    id: "deepseek",
+    label: "DeepSeek",
+    type: "openai",
+    endpoint: process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/chat/completions",
+    apiKeyEnv: "DEEPSEEK_API_KEY",
+    defaultModel: process.env.DEEPSEEK_MODEL || "deepseek-v4-flash",
+    models: ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
+    requiresKey: true
+  },
+  openai: {
+    id: "openai",
+    label: "OpenAI",
+    type: "openai",
+    endpoint: process.env.OPENAI_API_URL || "https://api.openai.com/v1/chat/completions",
+    apiKeyEnv: "OPENAI_API_KEY",
+    defaultModel: process.env.OPENAI_MODEL || "gpt-4o-mini",
+    models: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+    requiresKey: true
+  },
+  anthropic: {
+    id: "anthropic",
+    label: "Anthropic Claude",
+    type: "anthropic",
+    endpoint: process.env.ANTHROPIC_API_URL || "https://api.anthropic.com/v1/messages",
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    defaultModel: process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest",
+    models: ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest", "claude-3-opus-latest"],
+    requiresKey: true
+  },
+  gemini: {
+    id: "gemini",
+    label: "Google Gemini",
+    type: "gemini",
+    endpoint: process.env.GEMINI_API_URL || "https://generativelanguage.googleapis.com/v1beta/models",
+    apiKeyEnv: "GEMINI_API_KEY",
+    defaultModel: process.env.GEMINI_MODEL || "gemini-1.5-flash",
+    models: ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
+    requiresKey: true
+  },
+  openrouter: {
+    id: "openrouter",
+    label: "OpenRouter",
+    type: "openai",
+    endpoint: process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1/chat/completions",
+    apiKeyEnv: "OPENROUTER_API_KEY",
+    defaultModel: process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
+    models: ["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet", "google/gemini-flash-1.5"],
+    requiresKey: true
+  },
+  qwen: {
+    id: "qwen",
+    label: "通义千问",
+    type: "openai",
+    endpoint: process.env.DASHSCOPE_API_URL || "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    apiKeyEnv: "DASHSCOPE_API_KEY",
+    defaultModel: process.env.QWEN_MODEL || "qwen-plus",
+    models: ["qwen-plus", "qwen-turbo", "qwen-max"],
+    requiresKey: true
+  },
+  zhipu: {
+    id: "zhipu",
+    label: "智谱 GLM",
+    type: "openai",
+    endpoint: process.env.ZHIPU_API_URL || "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    apiKeyEnv: "ZHIPU_API_KEY",
+    defaultModel: process.env.ZHIPU_MODEL || "glm-4-flash",
+    models: ["glm-4-flash", "glm-4-plus", "glm-4-air"],
+    requiresKey: true
+  },
+  moonshot: {
+    id: "moonshot",
+    label: "Moonshot Kimi",
+    type: "openai",
+    endpoint: process.env.MOONSHOT_API_URL || "https://api.moonshot.cn/v1/chat/completions",
+    apiKeyEnv: "MOONSHOT_API_KEY",
+    defaultModel: process.env.MOONSHOT_MODEL || "moonshot-v1-8k",
+    models: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+    requiresKey: true
+  },
+  groq: {
+    id: "groq",
+    label: "Groq",
+    type: "openai",
+    endpoint: process.env.GROQ_API_URL || "https://api.groq.com/openai/v1/chat/completions",
+    apiKeyEnv: "GROQ_API_KEY",
+    defaultModel: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
+    models: ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
+    requiresKey: true
+  },
+  ollama: {
+    id: "ollama",
+    label: "Ollama 本地",
+    type: "openai",
+    endpoint: process.env.OLLAMA_API_URL || "http://127.0.0.1:11434/v1/chat/completions",
+    apiKeyEnv: "OLLAMA_API_KEY",
+    defaultModel: process.env.OLLAMA_MODEL || "llama3.1",
+    models: ["llama3.1", "qwen2.5", "mistral", "gemma2"],
+    requiresKey: false
+  },
+  custom: {
+    id: "custom",
+    label: "自定义 OpenAI-compatible",
+    type: "openai",
+    endpoint: process.env.CUSTOM_AI_API_URL || "",
+    apiKeyEnv: "CUSTOM_AI_API_KEY",
+    defaultModel: process.env.CUSTOM_AI_MODEL || "gpt-4o-mini",
+    models: [],
+    requiresKey: false,
+    endpointEditable: true
+  }
+};
+
+const defaultProvider = getProviderConfig(defaultProviderId);
+const defaultModel = defaultProvider.defaultModel;
+
 const server = createServer((req, res) => {
   handleRequest(req, res).catch(error => {
     sendJson(res, 500, {
@@ -44,14 +165,21 @@ const server = createServer((req, res) => {
   });
 });
 
+let resolveServerReady;
+export const serverReady = new Promise(resolve => {
+  resolveServerReady = resolve;
+});
+
 async function handleRequest(req, res) {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
 
     if (req.method === "GET" && url.pathname === "/api/health") {
       return sendJson(res, 200, {
-        hasServerKey: Boolean(process.env.DEEPSEEK_API_KEY),
+        hasServerKey: Boolean(getEnvApiKey(defaultProvider)),
+        defaultProvider: defaultProvider.id,
         defaultModel,
+        providers: getProviderSummaries(),
         nativeSpeech: getNativeSpeechStatus(),
         localWhisper: getLocalWhisperStatus()
       });
@@ -120,8 +248,29 @@ async function handleRequest(req, res) {
 }
 
 let activePort = port;
+let originalPortBusy = false;
+
+server.on("listening", () => {
+  const address = server.address();
+  if (address && typeof address === "object") {
+    activePort = address.port;
+  }
+
+  const url = `http://${host}:${activePort}`;
+  console.log(`Voice Polisher running at ${url}`);
+  if (originalPortBusy || activePort !== port) {
+    console.log(`Port ${port} was busy, so this session is using ${activePort}.`);
+  }
+
+  if (resolveServerReady) {
+    resolveServerReady({ host, port: activePort, url });
+    resolveServerReady = null;
+  }
+});
+
 server.on("error", error => {
   if (error.code === "EADDRINUSE" && activePort < port + 20) {
+    originalPortBusy = true;
     activePort += 1;
     server.listen(activePort, host);
     return;
@@ -130,26 +279,41 @@ server.on("error", error => {
   throw error;
 });
 
-server.listen(activePort, host, () => {
-  console.log(`Voice Polisher running at http://${host}:${activePort}`);
-  if (activePort !== port) {
-    console.log(`Port ${port} was busy, so this session is using ${activePort}.`);
-  }
-});
+server.listen(activePort, host);
 
 process.on("SIGINT", () => {
-  stopLocalWhisperWorker();
-  process.exit(0);
+  closeServer().finally(() => process.exit(0));
 });
 
 process.on("SIGTERM", () => {
-  stopLocalWhisperWorker();
-  process.exit(0);
+  closeServer().finally(() => process.exit(0));
 });
 
 process.on("exit", () => {
-  stopLocalWhisperWorker();
+  killLocalWhisperWorkerSync();
 });
+
+export function closeServer() {
+  const closeHttpServer = new Promise(resolveClose => {
+    if (!server.listening) {
+      resolveClose();
+      return;
+    }
+
+    server.closeIdleConnections?.();
+    server.close(() => {
+      resolveClose();
+    });
+    setTimeout(() => {
+      server.closeAllConnections?.();
+    }, 250);
+  });
+
+  return Promise.all([
+    stopLocalWhisperWorker({ forceAfterMs: 1000 }),
+    closeHttpServer
+  ]).then(() => undefined);
+}
 
 async function handleRefine(req, res) {
   let body;
@@ -162,8 +326,9 @@ async function handleRefine(req, res) {
   const transcript = String(body.transcript || "").trim();
   const mode = String(body.mode || "daily");
   const density = String(body.density || "balanced");
-  const model = String(body.model || defaultModel).trim() || defaultModel;
-  const apiKey = getApiKey(req, body);
+  const provider = getProviderConfig(body.provider, body.apiEndpoint);
+  const model = String(body.model || provider.defaultModel).trim() || provider.defaultModel;
+  const apiKey = getApiKey(req, body, provider);
 
   if (!transcript) {
     return sendJson(res, 400, { error: "没有可整理的口述内容。" });
@@ -177,53 +342,36 @@ async function handleRefine(req, res) {
     return sendJson(res, 200, {
       refined: transcript,
       model,
+      provider: provider.id,
       guarded: true
     });
   }
 
-  if (!apiKey) {
+  if (provider.requiresKey && !apiKey) {
     return sendJson(res, 401, {
-      error: "缺少 DeepSeek API key。请在 .env 中设置，或在页面设置里临时填写。"
+      error: `缺少 ${provider.label} API key。请在设置里填写，或在 .env 中配置 ${provider.apiKeyEnv}。`
     });
   }
 
-  const response = await fetch(deepseekEndpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      thinking: { type: "disabled" },
-      temperature: 0,
-      max_tokens: getMaxTokensForTranscript(transcript),
-      messages: buildMessages({ transcript, mode, density })
-    })
+  const result = await callModel({
+    provider,
+    apiKey,
+    model,
+    messages: buildMessages({ transcript, mode, density }),
+    maxTokens: getMaxTokensForTranscript(transcript)
   });
 
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    return sendJson(res, response.status, {
-      error:
-        data?.error?.message ||
-        data?.message ||
-        `DeepSeek 请求失败，状态码 ${response.status}。`
-    });
+  if (!result.ok) {
+    return sendJson(res, result.status, { error: result.error });
   }
 
-  const refined = data?.choices?.[0]?.message?.content?.trim();
-
-  if (!refined) {
-    return sendJson(res, 502, { error: "DeepSeek 没有返回可用内容。" });
-  }
-
+  const refined = result.text;
   const guardedRefined = guardRefinedOutput(transcript, refined);
 
   return sendJson(res, 200, {
     refined: guardedRefined,
-    model: data?.model || model,
+    model: result.model || model,
+    provider: provider.id,
     guarded: guardedRefined !== refined
   });
 }
@@ -236,51 +384,39 @@ async function handleTestKey(req, res) {
     return sendJson(res, 400, { error: "请求体不是有效的 JSON。" });
   }
 
-  const model = String(body.model || defaultModel).trim() || defaultModel;
-  const apiKey = getApiKey(req, body);
+  const provider = getProviderConfig(body.provider, body.apiEndpoint);
+  const model = String(body.model || provider.defaultModel).trim() || provider.defaultModel;
+  const apiKey = getApiKey(req, body, provider);
 
-  if (!apiKey) {
-    return sendJson(res, 401, { error: "请先粘贴 DeepSeek API key。" });
+  if (provider.requiresKey && !apiKey) {
+    return sendJson(res, 401, { error: `请先粘贴 ${provider.label} API key。` });
   }
 
-  const response = await fetch(deepseekEndpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      thinking: { type: "disabled" },
-      temperature: 0,
-      max_tokens: 16,
-      messages: [
-        {
-          role: "system",
-          content: "你是连通性测试助手，只回复 OK。"
-        },
-        {
-          role: "user",
-          content: "测试连接"
-        }
-      ]
-    })
+  const result = await callModel({
+    provider,
+    apiKey,
+    model,
+    maxTokens: 16,
+    messages: [
+      {
+        role: "system",
+        content: "你是连通性测试助手，只回复 OK。"
+      },
+      {
+        role: "user",
+        content: "测试连接"
+      }
+    ]
   });
 
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    return sendJson(res, response.status, {
-      error:
-        data?.error?.message ||
-        data?.message ||
-        `DeepSeek 连接失败，状态码 ${response.status}。`
-    });
+  if (!result.ok) {
+    return sendJson(res, result.status, { error: result.error });
   }
 
   return sendJson(res, 200, {
     ok: true,
-    model: data?.model || model
+    provider: provider.id,
+    model: result.model || model
   });
 }
 
@@ -445,7 +581,7 @@ function startLocalWhisperWorker() {
       defaultWhisperComputeType
     ],
     {
-      cwd: __dirname,
+      cwd: projectDir,
       windowsHide: true,
       env: {
         ...process.env,
@@ -540,6 +676,9 @@ function handleLocalWhisperWorkerEvent(session, event) {
     session.ready = true;
     session.loading = false;
     session.progress = 100;
+    session.device = event.device || session.device;
+    session.computeType = event.computeType || session.computeType;
+    session.model = event.model || session.model;
     session.message = event.message || "本地 Whisper 已就绪";
     session.lastEvent = event;
   } else if (type === "recording") {
@@ -579,7 +718,7 @@ function isIgnorableWhisperWarning(message) {
 function runLocalWhisperUtility(args) {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(getLocalPythonPath(), [localWhisperScript, ...args], {
-      cwd: __dirname,
+      cwd: projectDir,
       windowsHide: true,
       env: {
         ...process.env,
@@ -647,7 +786,7 @@ function scheduleLocalWhisperShutdownIfIdle() {
 
   localWhisperShutdownTimer = setTimeout(() => {
     if (localWhisperClients.size > 0) return;
-    stopLocalWhisperWorker();
+    stopLocalWhisperWorker({ forceAfterMs: 1800 });
   }, 5000);
 }
 
@@ -658,17 +797,73 @@ function clearLocalWhisperShutdownTimer() {
   }
 }
 
-function stopLocalWhisperWorker() {
-  if (!localWhisper?.process) return;
+function stopLocalWhisperWorker(options = {}) {
+  clearLocalWhisperShutdownTimer();
+
+  if (!localWhisper?.process) return Promise.resolve();
 
   const child = localWhisper.process;
-  sendLocalWhisperCommand({ type: "shutdown" });
+  localWhisper = null;
 
-  setTimeout(() => {
-    if (!child.killed) {
-      child.kill();
+  return new Promise(resolveStop => {
+    let resolved = false;
+    let forceKillTimer = null;
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+      }
+      resolveStop();
+    };
+
+    child.once("exit", finish);
+
+    try {
+      if (child.stdin?.writable) {
+        child.stdin.write(`${JSON.stringify({ type: "shutdown" })}\n`);
+      }
+    } catch {
+      // The process may already be exiting.
     }
-  }, 1800);
+
+    forceKillTimer = setTimeout(() => {
+      killProcessTree(child.pid).finally(finish);
+    }, options.forceAfterMs ?? 1800);
+  });
+}
+
+function killLocalWhisperWorkerSync() {
+  if (!localWhisper?.process) return;
+
+  try {
+    localWhisper.process.kill();
+  } catch {
+    // The process may already be gone.
+  }
+}
+
+function killProcessTree(pid) {
+  if (!pid) return Promise.resolve();
+
+  return new Promise(resolveKill => {
+    if (process.platform !== "win32") {
+      try {
+        process.kill(pid);
+      } catch {
+        // The process may already be gone.
+      }
+      resolveKill();
+      return;
+    }
+
+    const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore"
+    });
+    killer.on("exit", () => resolveKill());
+    killer.on("error", () => resolveKill());
+  });
 }
 
 function sendLocalWhisperEvent(payload, target = null) {
@@ -701,7 +896,7 @@ function startNativeDictation(culture) {
       culture
     ],
     {
-      cwd: __dirname,
+      cwd: projectDir,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     }
@@ -792,8 +987,10 @@ function getLocalWhisperStatus() {
     available: existsSync(localWhisperScript) && existsSync(getLocalPythonPath()),
     installed: existsSync(getLocalPythonPath()),
     defaultModel: defaultWhisperModel,
-    device: defaultWhisperDevice,
-    computeType: defaultWhisperComputeType,
+    device: workerRunning ? localWhisper.device || defaultWhisperDevice : defaultWhisperDevice,
+    computeType: workerRunning
+      ? localWhisper.computeType || defaultWhisperComputeType
+      : defaultWhisperComputeType,
     workerRunning,
     ready: Boolean(workerRunning && localWhisper.ready),
     loading: Boolean(workerRunning && localWhisper.loading),
@@ -806,7 +1003,9 @@ function getLocalWhisperStatus() {
 }
 
 function getLocalPythonPath() {
-  return process.env.WHISPER_PYTHON || localPythonPath;
+  if (process.env.WHISPER_PYTHON) return process.env.WHISPER_PYTHON;
+  if (existsSync(projectPythonPath)) return projectPythonPath;
+  return sourcePythonPath;
 }
 
 function normalizeSpeechCulture(culture) {
@@ -957,12 +1156,233 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-function getApiKey(req, body) {
+function getProviderConfig(providerId, endpointOverride = "") {
+  const id = String(providerId || defaultProviderId || "deepseek").trim().toLowerCase();
+  const preset = providerPresets[id] || providerPresets.deepseek;
+  const endpoint = String(endpointOverride || "").trim() || preset.endpoint;
+
+  return {
+    ...preset,
+    endpoint
+  };
+}
+
+function getProviderSummaries() {
+  return Object.values(providerPresets).map(provider => ({
+    id: provider.id,
+    label: provider.label,
+    defaultModel: provider.defaultModel,
+    models: provider.models,
+    requiresKey: provider.requiresKey,
+    endpoint: provider.endpoint,
+    endpointEditable: Boolean(provider.endpointEditable || provider.id === "custom"),
+    hasServerKey: Boolean(getEnvApiKey(provider))
+  }));
+}
+
+function getEnvApiKey(provider) {
+  return String(process.env[provider.apiKeyEnv] || "").trim();
+}
+
+function getApiKey(req, body, provider) {
+  const providerHeader = `x-${provider.id}-api-key`;
   return (
+    String(req.headers["x-ai-api-key"] || "").trim() ||
+    String(req.headers[providerHeader] || "").trim() ||
     String(req.headers["x-deepseek-api-key"] || "").trim() ||
     String(body.apiKey || "").trim() ||
-    process.env.DEEPSEEK_API_KEY
+    getEnvApiKey(provider)
   );
+}
+
+async function callModel({ provider, apiKey, model, messages, maxTokens }) {
+  if (!provider.endpoint) {
+    return {
+      ok: false,
+      status: 400,
+      error: `${provider.label} 缺少 API 地址。`
+    };
+  }
+
+  if (provider.type === "anthropic") {
+    return await callAnthropic({ provider, apiKey, model, messages, maxTokens });
+  }
+
+  if (provider.type === "gemini") {
+    return await callGemini({ provider, apiKey, model, messages, maxTokens });
+  }
+
+  return await callOpenAiCompatible({ provider, apiKey, model, messages, maxTokens });
+}
+
+async function callOpenAiCompatible({ provider, apiKey, model, messages, maxTokens }) {
+  const headers = {
+    "Content-Type": "application/json"
+  };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const response = await fetch(provider.endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      temperature: 0,
+      max_tokens: maxTokens,
+      messages
+    })
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    return modelError(provider, response.status, data);
+  }
+
+  const text = data?.choices?.[0]?.message?.content?.trim();
+  if (!text) {
+    return {
+      ok: false,
+      status: 502,
+      error: `${provider.label} 没有返回可用内容。`
+    };
+  }
+
+  return {
+    ok: true,
+    text,
+    model: data?.model || model
+  };
+}
+
+async function callAnthropic({ provider, apiKey, model, messages, maxTokens }) {
+  const system = messages.find(message => message.role === "system")?.content || "";
+  const anthropicMessages = messages
+    .filter(message => message.role !== "system")
+    .map(message => ({
+      role: message.role === "assistant" ? "assistant" : "user",
+      content: String(message.content || "")
+    }));
+
+  const response = await fetch(provider.endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model,
+      system,
+      max_tokens: maxTokens,
+      temperature: 0,
+      messages: anthropicMessages
+    })
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    return modelError(provider, response.status, data);
+  }
+
+  const text = (data?.content || [])
+    .map(part => part?.text || "")
+    .join("")
+    .trim();
+
+  if (!text) {
+    return {
+      ok: false,
+      status: 502,
+      error: `${provider.label} 没有返回可用内容。`
+    };
+  }
+
+  return {
+    ok: true,
+    text,
+    model: data?.model || model
+  };
+}
+
+async function callGemini({ provider, apiKey, model, messages, maxTokens }) {
+  const system = messages.find(message => message.role === "system")?.content || "";
+  const userText = messages
+    .filter(message => message.role !== "system")
+    .map(message => String(message.content || ""))
+    .join("\n\n");
+  const endpoint = buildGeminiEndpoint(provider.endpoint, model, apiKey);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      systemInstruction: system ? { parts: [{ text: system }] } : undefined,
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: userText }]
+        }
+      ],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: maxTokens
+      }
+    })
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    return modelError(provider, response.status, data);
+  }
+
+  const text = (data?.candidates?.[0]?.content?.parts || [])
+    .map(part => part?.text || "")
+    .join("")
+    .trim();
+
+  if (!text) {
+    return {
+      ok: false,
+      status: 502,
+      error: `${provider.label} 没有返回可用内容。`
+    };
+  }
+
+  return {
+    ok: true,
+    text,
+    model
+  };
+}
+
+function buildGeminiEndpoint(baseEndpoint, model, apiKey) {
+  const base = baseEndpoint.replace(/\/$/, "");
+  const separator = base.includes("?") ? "&" : "?";
+
+  if (base.includes(":generateContent")) {
+    return apiKey ? `${base}${separator}key=${encodeURIComponent(apiKey)}` : base;
+  }
+
+  const url = `${base}/${encodeURIComponent(model)}:generateContent`;
+  return apiKey ? `${url}?key=${encodeURIComponent(apiKey)}` : url;
+}
+
+function modelError(provider, status, data) {
+  return {
+    ok: false,
+    status,
+    error:
+      data?.error?.message ||
+      data?.error ||
+      data?.message ||
+      `${provider.label} 请求失败，状态码 ${status}。`
+  };
 }
 
 function loadDotEnv(filePath) {

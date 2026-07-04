@@ -1,4 +1,4 @@
 @echo off
 setlocal
-start "" wscript.exe "%~dp0start-voice-polisher.vbs"
+start "" powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0launcher.ps1"
 exit /b

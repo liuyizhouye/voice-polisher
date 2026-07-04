@@ -20,10 +20,13 @@ const elements = {
   modeSelect: $("#modeSelect"),
   densitySelect: $("#densitySelect"),
   languageSelect: $("#languageSelect"),
+  providerSelect: $("#providerSelect"),
   modelInput: $("#modelInput"),
+  modelOptions: $("#modelOptions"),
   modelStatus: $("#modelStatus"),
   modelChip: $("#modelChip"),
   apiKeyInput: $("#apiKeyInput"),
+  apiEndpointInput: $("#apiEndpointInput"),
   rememberKeyInput: $("#rememberKeyInput"),
   connectButton: $("#connectButton"),
   refineButton: $("#refineButton"),
@@ -42,6 +45,9 @@ const storageKeys = {
   history: "voice-polisher-history",
   apiKey: "voice-polisher-api-key",
   rememberKey: "voice-polisher-remember-key",
+  provider: "voice-polisher-provider",
+  model: "voice-polisher-model",
+  apiEndpoint: "voice-polisher-api-endpoint",
   microphone: "voice-polisher-microphone",
   theme: "voice-polisher-theme"
 };
@@ -65,12 +71,12 @@ let audioStream = null;
 let analyser = null;
 let animationFrame = 0;
 let history = loadJson(storageKeys.history, []);
+let aiProviders = [];
 
 init();
 
 async function init() {
   restoreTheme();
-  restoreKey();
   bindEvents();
   renderHistory();
   drawIdleWave();
@@ -84,10 +90,9 @@ async function init() {
     const health = await response.json();
     localWhisper = health.localWhisper || { available: false };
     nativeSpeech = health.nativeSpeech || { available: false };
-    elements.modelInput.value = health.defaultModel || "deepseek-v4-flash";
-    elements.modelChip.textContent = elements.modelInput.value;
-    elements.modelStatus.textContent = health.hasServerKey ? "DeepSeek 已配置" : "等待 API key";
+    configureAiSettings(health);
   } catch {
+    configureAiSettings({});
     elements.modelStatus.textContent = "本地服务未响应";
   }
 
@@ -95,7 +100,7 @@ async function init() {
     activeRecorder = "whisper";
     localWhisperReady = Boolean(localWhisper.ready);
     elements.supportStatus.textContent =
-      `本地 Whisper ${localWhisper.device || "cuda"} / ${localWhisper.defaultModel || "large-v3"}`;
+      `本地 Whisper ${localWhisper.device || "cuda"} / ${localWhisper.defaultModel || "small"}`;
     elements.listenState.textContent = localWhisperReady
       ? "本地 Whisper 已就绪"
       : "正在准备本地 Whisper";
@@ -208,12 +213,28 @@ function bindEvents() {
     window.setTimeout(startRecording, 250);
   });
 
+  elements.providerSelect.addEventListener("change", () => {
+    localStorage.setItem(storageKeys.provider, elements.providerSelect.value);
+    restoreProviderFields();
+    elements.modelStatus.textContent = getSelectedProvider().requiresKey
+      ? "等待 API key"
+      : "可直接连接";
+  });
+
   elements.modelInput.addEventListener("input", () => {
-    elements.modelChip.textContent = elements.modelInput.value.trim() || "deepseek-v4-flash";
+    const provider = getSelectedProvider();
+    elements.modelChip.textContent =
+      elements.modelInput.value.trim() || provider.defaultModel || "deepseek-v4-flash";
+    elements.modelStatus.textContent = "等待连接";
+    persistAiSettings();
+  });
+
+  elements.apiEndpointInput.addEventListener("input", () => {
+    persistAiSettings();
     elements.modelStatus.textContent = "等待连接";
   });
 
-  elements.connectButton.addEventListener("click", testDeepSeekConnection);
+  elements.connectButton.addEventListener("click", testModelConnection);
   elements.refineButton.addEventListener("click", refineTranscript);
   elements.copyButton.addEventListener("click", copyResult);
   elements.downloadButton.addEventListener("click", downloadResult);
@@ -222,17 +243,18 @@ function bindEvents() {
 
   elements.rememberKeyInput.addEventListener("change", () => {
     if (!elements.rememberKeyInput.checked) {
+      localStorage.removeItem(apiKeyStorageKey(elements.providerSelect.value));
       localStorage.removeItem(storageKeys.apiKey);
       localStorage.setItem(storageKeys.rememberKey, "false");
       showToast("已取消保存 API key");
     } else {
       localStorage.setItem(storageKeys.rememberKey, "true");
-      persistKeyIfNeeded();
+      persistAiSettings();
     }
   });
 
-  elements.apiKeyInput.addEventListener("input", persistKeyIfNeeded);
   elements.apiKeyInput.addEventListener("input", () => {
+    persistAiSettings();
     elements.modelStatus.textContent = "等待连接";
   });
 
@@ -440,8 +462,8 @@ function handleLocalWhisperEvent(event) {
     updateLocalWhisperProgress({ ...event, ready: true, progress: 100 });
     recognitionState = "started";
     elements.supportStatus.textContent =
-      `本地 Whisper ${event.device || "cuda"} / ${event.model || "large-v3"}`;
-    elements.listenState.textContent = `本地 Whisper 已准备 (${event.model || "large-v3"})`;
+      `本地 Whisper ${event.device || "cuda"} / ${event.model || "small"}`;
+    elements.listenState.textContent = `本地 Whisper 已准备 (${event.model || "small"})`;
     updateRecordingUi();
     return;
   }
@@ -1035,7 +1057,7 @@ function updateLocalWhisperProgress(status) {
   );
   localWhisperReady = Boolean(status.ready || progress >= 100);
 
-  const model = status.model || status.defaultModel || localWhisper.defaultModel || "large-v3";
+  const model = status.model || status.defaultModel || localWhisper.defaultModel || "small";
   const device = status.device || localWhisper.device || "cuda";
   const computeType = status.computeType || localWhisper.computeType || "float16";
   const message =
@@ -1180,9 +1202,10 @@ async function refineTranscript() {
     return;
   }
 
-  persistKeyIfNeeded();
+  persistAiSettings();
+  const provider = getSelectedProvider();
   const apiKey = elements.apiKeyInput.value.trim();
-  const model = elements.modelInput.value.trim() || "deepseek-v4-flash";
+  const model = elements.modelInput.value.trim() || provider.defaultModel || "deepseek-v4-flash";
 
   elements.refineButton.disabled = true;
   elements.refineButton.querySelector("span").textContent = "整理中";
@@ -1193,9 +1216,7 @@ async function refineTranscript() {
       "Content-Type": "application/json"
     };
 
-    if (apiKey) {
-      headers["x-deepseek-api-key"] = apiKey;
-    }
+    headers["x-ai-api-key"] = apiKey;
 
     const response = await fetch("/api/refine", {
       method: "POST",
@@ -1204,6 +1225,8 @@ async function refineTranscript() {
         transcript,
         mode: elements.modeSelect.value,
         density: elements.densitySelect.value,
+        provider: provider.id,
+        apiEndpoint: elements.apiEndpointInput.value.trim(),
         model
       })
     });
@@ -1222,6 +1245,7 @@ async function refineTranscript() {
       refined: payload.refined,
       mode: elements.modeSelect.value,
       density: elements.densitySelect.value,
+      provider: provider.id,
       model: payload.model || model
     });
     showToast("整理好了");
@@ -1234,30 +1258,35 @@ async function refineTranscript() {
   }
 }
 
-async function testDeepSeekConnection() {
-  persistKeyIfNeeded();
+async function testModelConnection() {
+  persistAiSettings();
 
+  const provider = getSelectedProvider();
   const apiKey = elements.apiKeyInput.value.trim();
-  const model = elements.modelInput.value.trim() || "deepseek-v4-flash";
+  const model = elements.modelInput.value.trim() || provider.defaultModel || "deepseek-v4-flash";
 
-  if (!apiKey) {
-    showToast("先粘贴 DeepSeek API key");
+  if (provider.requiresKey && !apiKey) {
+    showToast(`先粘贴 ${provider.label} API key`);
     elements.apiKeyInput.focus();
     return;
   }
 
   elements.connectButton.disabled = true;
   elements.connectButton.querySelector("span").textContent = "连接中";
-  elements.modelStatus.textContent = "正在连接 DeepSeek";
+  elements.modelStatus.textContent = `正在连接 ${provider.label}`;
 
   try {
     const response = await fetch("/api/test-key", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-deepseek-api-key": apiKey
+        "x-ai-api-key": apiKey
       },
-      body: JSON.stringify({ model })
+      body: JSON.stringify({
+        provider: provider.id,
+        apiEndpoint: elements.apiEndpointInput.value.trim(),
+        model
+      })
     });
 
     const payload = await response.json();
@@ -1266,7 +1295,7 @@ async function testDeepSeekConnection() {
       throw new Error(payload.error || "连接失败");
     }
 
-    elements.modelStatus.textContent = "DeepSeek 已连接";
+    elements.modelStatus.textContent = `${provider.label} 已连接`;
     elements.modelChip.textContent = payload.model || model;
     showToast("连接成功");
   } catch (error) {
@@ -1353,6 +1382,11 @@ function renderHistory() {
       elements.resultOutput.value = item.refined || "";
       elements.modeSelect.value = item.mode || "daily";
       elements.densitySelect.value = item.density || "balanced";
+      if (item.provider && elements.providerSelect.querySelector(`option[value="${item.provider}"]`)) {
+        elements.providerSelect.value = item.provider;
+        localStorage.setItem(storageKeys.provider, item.provider);
+        restoreProviderFields();
+      }
       elements.modelInput.value = item.model || elements.modelInput.value;
       elements.modelChip.textContent = elements.modelInput.value;
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1378,20 +1412,122 @@ function joinSpeech(existing, segment) {
   return `${base}${separator}${text}`;
 }
 
-function restoreKey() {
-  const remember = localStorage.getItem(storageKeys.rememberKey) === "true";
-  elements.rememberKeyInput.checked = remember;
+function configureAiSettings(health) {
+  aiProviders = Array.isArray(health.providers) && health.providers.length
+    ? health.providers
+    : [
+        {
+          id: "deepseek",
+          label: "DeepSeek",
+          defaultModel: health.defaultModel || "deepseek-v4-flash",
+          models: ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
+          endpoint: "https://api.deepseek.com/chat/completions",
+          requiresKey: true
+        }
+      ];
 
-  if (remember) {
-    elements.apiKeyInput.value = localStorage.getItem(storageKeys.apiKey) || "";
+  elements.providerSelect.innerHTML = "";
+  for (const provider of aiProviders) {
+    const option = document.createElement("option");
+    option.value = provider.id;
+    option.textContent = provider.label;
+    elements.providerSelect.append(option);
+  }
+
+  const savedProvider = localStorage.getItem(storageKeys.provider);
+  const defaultProvider = health.defaultProvider || aiProviders[0]?.id || "deepseek";
+  elements.providerSelect.value = aiProviders.some(provider => provider.id === savedProvider)
+    ? savedProvider
+    : defaultProvider;
+
+  if (!elements.providerSelect.value && aiProviders[0]) {
+    elements.providerSelect.value = aiProviders[0].id;
+  }
+
+  if (localStorage.getItem(storageKeys.rememberKey) !== "false") {
+    localStorage.setItem(storageKeys.rememberKey, "true");
+  }
+  elements.rememberKeyInput.checked = localStorage.getItem(storageKeys.rememberKey) !== "false";
+
+  restoreProviderFields(health);
+}
+
+function restoreProviderFields(health = {}) {
+  const provider = getSelectedProvider();
+  const providerId = provider.id;
+  const savedModel = localStorage.getItem(modelStorageKey(providerId));
+  const savedEndpoint = localStorage.getItem(apiEndpointStorageKey(providerId));
+  const savedKey = localStorage.getItem(apiKeyStorageKey(providerId));
+  const oldSavedKey = providerId === "deepseek" ? localStorage.getItem(storageKeys.apiKey) : "";
+
+  elements.modelInput.value =
+    savedModel || (providerId === health.defaultProvider ? health.defaultModel : "") ||
+    provider.defaultModel ||
+    "deepseek-v4-flash";
+  elements.modelChip.textContent = elements.modelInput.value;
+  elements.apiEndpointInput.value = savedEndpoint || provider.endpoint || "";
+  elements.apiKeyInput.value = elements.rememberKeyInput.checked ? savedKey || oldSavedKey || "" : "";
+
+  renderModelOptions(provider);
+  persistAiSettings({ skipKey: !elements.rememberKeyInput.checked });
+  elements.modelStatus.textContent = getProviderStatusText(provider);
+}
+
+function persistAiSettings(options = {}) {
+  const provider = getSelectedProvider();
+  const providerId = provider.id;
+
+  localStorage.setItem(storageKeys.provider, providerId);
+  localStorage.setItem(modelStorageKey(providerId), elements.modelInput.value.trim());
+  localStorage.setItem(apiEndpointStorageKey(providerId), elements.apiEndpointInput.value.trim());
+
+  if (!options.skipKey && elements.rememberKeyInput.checked) {
+    localStorage.setItem(storageKeys.rememberKey, "true");
+    localStorage.setItem(apiKeyStorageKey(providerId), elements.apiKeyInput.value.trim());
   }
 }
 
-function persistKeyIfNeeded() {
-  if (!elements.rememberKeyInput.checked) return;
+function getSelectedProvider() {
+  return (
+    aiProviders.find(provider => provider.id === elements.providerSelect.value) ||
+    aiProviders[0] || {
+      id: "deepseek",
+      label: "DeepSeek",
+      defaultModel: "deepseek-v4-flash",
+      endpoint: "https://api.deepseek.com/chat/completions",
+      requiresKey: true,
+      models: []
+    }
+  );
+}
 
-  localStorage.setItem(storageKeys.rememberKey, "true");
-  localStorage.setItem(storageKeys.apiKey, elements.apiKeyInput.value.trim());
+function renderModelOptions(provider) {
+  elements.modelOptions.innerHTML = "";
+  for (const model of provider.models || []) {
+    const option = document.createElement("option");
+    option.value = model;
+    elements.modelOptions.append(option);
+  }
+}
+
+function getProviderStatusText(provider) {
+  if (!provider.requiresKey) return `${provider.label} 可直接使用`;
+  if (provider.hasServerKey || elements.apiKeyInput.value.trim()) {
+    return `${provider.label} 已配置`;
+  }
+  return "等待 API key";
+}
+
+function modelStorageKey(providerId) {
+  return `${storageKeys.model}:${providerId}`;
+}
+
+function apiKeyStorageKey(providerId) {
+  return `${storageKeys.apiKey}:${providerId}`;
+}
+
+function apiEndpointStorageKey(providerId) {
+  return `${storageKeys.apiEndpoint}:${providerId}`;
 }
 
 function restoreTheme() {

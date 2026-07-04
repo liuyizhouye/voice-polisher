@@ -3,6 +3,7 @@
 !.env.example
 node_modules/
 .venv/
+dist/
 __pycache__/
 npm-debug.log*
 yarn-debug.log*

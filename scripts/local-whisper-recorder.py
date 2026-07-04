@@ -1,5 +1,8 @@
 import argparse
+import ctypes
+import ctypes.util
 import json
+import os
 import queue
 import sys
 import tempfile
@@ -10,6 +13,14 @@ from pathlib import Path
 
 
 EMIT_LOCK = threading.Lock()
+MODEL_FILES = [
+    "config.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "vocabulary.json",
+    "vocabulary.txt",
+    "model.bin",
+]
 
 
 def emit(payload):
@@ -19,7 +30,7 @@ def emit(payload):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="large-v3")
+    parser.add_argument("--model", default="small")
     parser.add_argument("--language", default="zh")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--compute-type", default="float16")
@@ -68,6 +79,8 @@ class LocalWhisperWorker:
         self.model = None
         self.np = None
         self.sd = None
+        self.runtime_device = args.device
+        self.runtime_compute_type = args.compute_type
         self.ready = False
         self.busy = False
         self.busy_lock = threading.Lock()
@@ -117,18 +130,43 @@ class LocalWhisperWorker:
                 "message": f"麦克风列表读取失败：{error}",
             })
 
-        message = (
-            f"正在下载/加载 {self.args.model}，首次启动会比较久；"
-            "后续打开会直接使用本地缓存"
+        self.runtime_device, self.runtime_compute_type = resolve_runtime(
+            self.args.device,
+            self.args.compute_type,
         )
-        ticker = ProgressTicker(14, 88, message)
+
+        model_source = self.args.model
+        ticker = None
+
+        try:
+            model_source, cached = ensure_model_snapshot(self.args.model)
+            memory_target = "显存" if self.runtime_device == "cuda" else "内存"
+            message = (
+                f"正在从本地缓存加载 {self.args.model}"
+                if cached
+                else f"{self.args.model} 下载完成，正在加载到{memory_target}"
+            )
+        except Exception as error:
+            emit({
+                "type": "error",
+                "fatal": True,
+                "message": (
+                    f"本地 Whisper 模型准备失败：{error}。"
+                    "如果之前下载被中断，请关闭软件后清理 HuggingFace 缓存里的 "
+                    "*.incomplete 文件再重试。"
+                ),
+            })
+            return False
+
+        ticker_start = 14 if cached else 72
+        ticker = ProgressTicker(ticker_start, 88, message)
         ticker.start_ticking()
 
         try:
             self.model = WhisperModel(
-                self.args.model,
-                device=self.args.device,
-                compute_type=self.args.compute_type,
+                model_source,
+                device=self.runtime_device,
+                compute_type=self.runtime_compute_type,
             )
         except Exception as error:
             ticker.stop()
@@ -137,8 +175,8 @@ class LocalWhisperWorker:
                 "fatal": True,
                 "message": (
                     "本地 Whisper 模型加载失败。"
-                    f"model={self.args.model}, device={self.args.device}, "
-                    f"compute_type={self.args.compute_type}. Details: {error}"
+                    f"model={self.args.model}, device={self.runtime_device}, "
+                    f"compute_type={self.runtime_compute_type}. Details: {error}"
                 ),
             })
             return False
@@ -150,8 +188,8 @@ class LocalWhisperWorker:
             "progress": 100,
             "engine": "faster-whisper",
             "model": self.args.model,
-            "device": self.args.device,
-            "computeType": self.args.compute_type,
+            "device": self.runtime_device,
+            "computeType": self.runtime_compute_type,
             "sampleRate": self.args.sample_rate,
             "message": "本地 Whisper 已就绪",
         })
@@ -361,6 +399,130 @@ def normalize_language(language):
         "en-US": "en",
         "en": "en",
     }.get(str(language), "zh")
+
+
+def resolve_runtime(device, compute_type):
+    device = str(device or "cpu").lower()
+    compute_type = str(compute_type or "int8").lower()
+
+    if device != "cuda":
+        return device, compute_type
+
+    missing = get_missing_cuda_runtime_dlls()
+    if not missing:
+        return "cuda", compute_type
+
+    emit({
+        "type": "warning",
+        "message": (
+            "CUDA 运行库不完整，缺少 "
+            f"{', '.join(missing)}。已自动切换到 CPU/int8，"
+            "不会影响使用，但转写会慢一些。"
+        ),
+    })
+    return "cpu", "int8"
+
+
+def get_missing_cuda_runtime_dlls():
+    if os.name != "nt":
+        return []
+
+    required = ["cublas64_12.dll"]
+    missing = []
+
+    for dll_name in required:
+        if not can_load_windows_dll(dll_name):
+            missing.append(dll_name)
+
+    return missing
+
+
+def can_load_windows_dll(dll_name):
+    try:
+        ctypes.WinDLL(dll_name)
+        return True
+    except OSError:
+        pass
+
+    dll_path = ctypes.util.find_library(dll_name)
+    if not dll_path:
+        return False
+
+    try:
+        ctypes.WinDLL(dll_path)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_model_snapshot(model_name):
+    model_path = Path(str(model_name)).expanduser()
+    if model_path.exists():
+        validate_model_dir(model_path)
+        return str(model_path), True
+
+    repo_id = normalize_model_repo_id(model_name)
+
+    cached_path = try_get_cached_snapshot(repo_id)
+    if cached_path:
+        emit({
+            "type": "progress",
+            "progress": 14,
+            "message": f"已找到 {model_name} 本地缓存，正在加载模型",
+        })
+        return str(cached_path), True
+
+    emit({
+        "type": "progress",
+        "progress": 14,
+        "message": f"{model_name} 尚未完整缓存，正在下载模型文件",
+    })
+
+    from huggingface_hub import snapshot_download
+
+    ticker = ProgressTicker(14, 70, f"正在下载 {model_name} 模型文件")
+    ticker.start_ticking()
+    try:
+        downloaded_path = Path(snapshot_download(
+            repo_id,
+            allow_patterns=MODEL_FILES,
+        ))
+    finally:
+        ticker.stop()
+
+    validate_model_dir(downloaded_path)
+    return str(downloaded_path), False
+
+
+def try_get_cached_snapshot(repo_id):
+    try:
+        from huggingface_hub import snapshot_download
+
+        cached_path = Path(snapshot_download(
+            repo_id,
+            allow_patterns=MODEL_FILES,
+            local_files_only=True,
+        ))
+        validate_model_dir(cached_path)
+        return cached_path
+    except Exception:
+        return None
+
+
+def validate_model_dir(model_dir):
+    model_dir = Path(model_dir)
+    if not (model_dir / "model.bin").exists():
+        raise FileNotFoundError(f"{model_dir} 缺少 model.bin")
+
+    if not (model_dir / "config.json").exists():
+        raise FileNotFoundError(f"{model_dir} 缺少 config.json")
+
+
+def normalize_model_repo_id(model_name):
+    value = str(model_name).strip()
+    if "/" in value:
+        return value
+    return f"Systran/faster-whisper-{value}"
 
 
 def list_devices():

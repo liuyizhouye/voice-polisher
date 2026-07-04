@@ -1,13 +1,46 @@
 {
   "name": "voice-polisher",
   "version": "0.1.0",
+  "description": "本地运行的口述听写与整理工具",
   "private": true,
   "type": "module",
+  "main": "desktop/main.cjs",
   "scripts": {
     "start": "node server.js",
+    "desktop": "electron .",
+    "desktop:smoke": "electron . --smoke-test",
+    "build:win": "electron-builder --win dir",
     "setup:whisper": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-local-whisper.ps1"
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "local.voice-polisher",
+    "productName": "口述整理台",
+    "asar": false,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "desktop/**/*",
+      "public/**/*",
+      "scripts/**/*",
+      "server.js",
+      "requirements-whisper.txt",
+      ".env.example",
+      "package.json"
+    ],
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        "dir"
+      ],
+      "artifactName": "口述整理台-${version}-${arch}.${ext}"
+    }
   }
 }

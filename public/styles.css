@@ -441,6 +441,11 @@ input {
   min-width: 92px;
 }
 
+.endpoint-field {
+  display: block;
+  margin-bottom: 14px;
+}
+
 .refine-button {
   width: 100%;
   margin-bottom: 14px;
