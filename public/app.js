@@ -237,9 +237,16 @@ function bindEvents() {
   elements.connectButton.addEventListener("click", testModelConnection);
   elements.refineButton.addEventListener("click", refineTranscript);
   elements.copyButton.addEventListener("click", copyResult);
-  elements.downloadButton.addEventListener("click", downloadResult);
+  elements.downloadButton.addEventListener("click", saveNote);
   elements.clearHistoryButton.addEventListener("click", clearHistory);
   elements.themeButton.addEventListener("click", toggleTheme);
+
+  window.addEventListener("keydown", event => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      saveNote();
+    }
+  });
 
   elements.rememberKeyInput.addEventListener("change", () => {
     if (!elements.rememberKeyInput.checked) {
@@ -1318,32 +1325,124 @@ async function copyResult() {
   showToast("已复制");
 }
 
-function downloadResult() {
-  const text = elements.resultOutput.value.trim();
-  if (!text) {
-    showToast("没有可下载的内容");
+async function saveNote() {
+  const note = buildSavedNote();
+  if (!note.hasContent) {
+    showToast("没有可保存的内容");
     return;
   }
 
-  const date = new Date();
-  const stamp = [
+  elements.downloadButton.disabled = true;
+  elements.downloadButton.querySelector("span").textContent = "保存中";
+
+  try {
+    if (window.voicePolisher?.saveNote) {
+      const result = await window.voicePolisher.saveNote({
+        content: note.content,
+        suggestedName: note.fileName
+      });
+
+      if (result?.canceled) return;
+      if (!result?.ok) {
+        throw new Error(result?.error || "保存失败");
+      }
+
+      showToast(`已保存：${baseName(result.filePath)}`);
+      return;
+    }
+
+    downloadNoteFallback(note);
+    showToast("已保存");
+  } catch (error) {
+    showToast(error?.message || "保存失败");
+  } finally {
+    elements.downloadButton.disabled = false;
+    elements.downloadButton.querySelector("span").textContent = "保存";
+  }
+}
+
+function buildSavedNote() {
+  const transcript = elements.transcriptInput.value.trim();
+  const refined = elements.resultOutput.value.trim();
+  const provider = getSelectedProvider();
+  const model = elements.modelInput.value.trim() || provider.defaultModel || "deepseek-v4-flash";
+  const createdAt = new Date();
+  const title = firstMeaningfulLine(refined || transcript) || "口述整理";
+  const content = [
+    `# ${title}`,
+    "",
+    `- 保存时间：${formatDateTime(createdAt)}`,
+    `- 场景：${labelForMode(elements.modeSelect.value)}`,
+    `- 详略：${labelForDensity(elements.densitySelect.value)}`,
+    `- 服务商：${provider.label}`,
+    `- 模型：${model}`,
+    "",
+    "## 整理结果",
+    "",
+    refined || "（暂无整理结果）",
+    "",
+    "## 原始口述",
+    "",
+    transcript || "（暂无原始口述）",
+    ""
+  ].join("\n");
+
+  return {
+    content,
+    fileName: `${formatFileStamp(createdAt)}-${slugFileName(title)}.md`,
+    hasContent: Boolean(transcript || refined)
+  };
+}
+
+function downloadNoteFallback(note) {
+  const blob = new Blob([note.content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = note.fileName;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function firstMeaningfulLine(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(Boolean)
+    ?.slice(0, 42);
+}
+
+function slugFileName(value) {
+  const cleaned = String(value || "口述整理")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 36);
+  return cleaned || "口述整理";
+}
+
+function formatFileStamp(date) {
+  return [
     date.getFullYear(),
     String(date.getMonth() + 1).padStart(2, "0"),
     String(date.getDate()).padStart(2, "0"),
     String(date.getHours()).padStart(2, "0"),
     String(date.getMinutes()).padStart(2, "0")
   ].join("");
+}
 
-  const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `voice-note-${stamp}.md`;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
-  showToast("已下载");
+function formatDateTime(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
+    date.getDate()
+  ).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(
+    date.getMinutes()
+  ).padStart(2, "0")}`;
+}
+
+function baseName(filePath) {
+  return String(filePath || "").split(/[\\/]/).pop() || "文件";
 }
 
 function addHistory(item) {
@@ -1570,6 +1669,14 @@ function labelForMode(mode) {
     todo: "待办",
     formal: "正式"
   }[mode] || "记录";
+}
+
+function labelForDensity(density) {
+  return {
+    concise: "只留核心",
+    balanced: "自然整理",
+    complete: "完整表达"
+  }[density] || "自然整理";
 }
 
 function formatDate(iso) {

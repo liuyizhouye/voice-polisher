@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
@@ -28,6 +28,32 @@ if (!hasSingleInstanceLock) {
     app.quit();
   });
 }
+
+ipcMain.handle("voice-polisher:save-note", async (_event, payload = {}) => {
+  const content = String(payload.content || "");
+  if (!content.trim()) {
+    return { ok: false, error: "没有可保存的内容。" };
+  }
+
+  const suggestedName = sanitizeFileName(payload.suggestedName || "voice-note.md");
+  const defaultPath = path.join(app.getPath("documents"), suggestedName);
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "保存口述整理",
+    defaultPath,
+    filters: [
+      { name: "Markdown", extensions: ["md"] },
+      { name: "Text", extensions: ["txt"] },
+      { name: "All Files", extensions: ["*"] }
+    ]
+  });
+
+  if (result.canceled || !result.filePath) {
+    return { ok: false, canceled: true };
+  }
+
+  await fs.promises.writeFile(result.filePath, content, "utf8");
+  return { ok: true, filePath: result.filePath };
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
@@ -106,9 +132,10 @@ function createMainWindow() {
     autoHideMenuBar: true,
     show: false,
     webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: false
     }
   });
 
@@ -373,4 +400,14 @@ function showStartupError(error) {
   const message = error instanceof Error ? error.message : String(error);
   writeLog(`startup error: ${message}\n${error?.stack || ""}`);
   dialog.showErrorBox("口述整理台启动失败", message);
+}
+
+function sanitizeFileName(value) {
+  const cleaned = String(value)
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const fileName = cleaned || "voice-note.md";
+  return fileName.toLowerCase().endsWith(".md") ? fileName : `${fileName}.md`;
 }
